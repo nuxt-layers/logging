@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createLogging, type Options, type Diagnostic } from '../src/index.ts'
+import { createLogging, type Options, type Diagnostic } from '../../src/index.ts'
 const stamp='2026-11-26T00:00:00Z'
 const event={tenantId:'a',subjectId:'service',assurance:null,source:'worker'}
 const diagnostic: Diagnostic={version:1,code:'worker.done',severity:'info',occurrenceTime:stamp,attributes:{latency:3}}

@@ -11,13 +11,23 @@
     ".": {
       "types": "./src/index.ts",
       "default": "./src/index.ts"
-    }
+    },
+    "./nuxt": "./nuxt.config.ts",
+    "./nuxt/server": "./server/utils/logging.ts"
   },
   "scripts": {
-    "test": "node --test tests/*.test.ts",
+    "test": "node --test tests/unit/*.test.ts tests/integration/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "typescript": "6.0.3"
+  },
+  "peerDependencies": {
+    "nuxt": "^4.6.4"
+  },
+  "peerDependenciesMeta": {
+    "nuxt": {
+      "optional": true
+    }
   }
 }

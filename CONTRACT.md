@@ -6,7 +6,7 @@ Use `"@nuxt-layers/logging": "github:nuxt-layers/logging#master"` after acceptan
 
 ## Settings
 
-Pass options to the single composition call. No environment variables. Capacity defaults to 1000 (max 10000), ratePerMinute to 120 (max 10000), timeoutMs to 1000 (max 30000). Required retentionMs is a positive integer at most 30 days; applies only to process-local read history. policyRevision is a bounded identifier. Invalid limits or rules throw at composition.
+Pass options to the single composition call. No environment variables for the core. Optional Nuxt layer entry: extend '@nuxt-layers/logging/nuxt'. Its server-only runtimeConfig.logging.presentation defaults to false; no pages or HTTP endpoints are registered yet. Capacity defaults to 1000 (max 10000), ratePerMinute to 120 (max 10000), timeoutMs to 1000 (max 30000). Required retentionMs is a positive integer at most 30 days; applies only to process-local read history. policyRevision is a bounded identifier. Invalid limits or rules throw at composition.
 
 ## Host passes
 
@@ -37,7 +37,7 @@ logging.submit, logging.read on explicit tenant/source. Reads require matching t
 
 ## Screens
 
-Not applicable: no presentation shipped.
+No presentation shipped. The optional Nuxt adapter exports provideLogging(app, options), getLogging(app) and closeLogging(app) from '@nuxt-layers/logging/nuxt/server'. Compose once in a Nitro plugin using the same core options specialised to H3Event; duplicate composition throws LOG_ALREADY_COMPOSED. getLogging returns undefined before composition. Register closeLogging on the Nitro close hook. No automatic access grants, browser intake or endpoints. Nuxt 4.6.4 compatibility is targeted, not verified. The host owns Nuxt and h3 dependencies. The example is deny-all, not a production provider. The approved six screens remain outstanding.
 
 ## Headless surface
 
