@@ -27,12 +27,16 @@ export function effectiveRules(floors:Map<string,Rule>,input:readonly Rule[],sou
   }
   return [...rules.values()]
 }
-function plain(v:unknown):v is Record<string,unknown> {
+export function plain(v:unknown):v is Record<string,unknown> {
   return !!v&&typeof v==='object'&&(Object.getPrototypeOf(v)===Object.prototype||Object.getPrototypeOf(v)===null)
 }
-function fields(v:Record<string,unknown>,allow:readonly string[]) {
+export function fields(v:Record<string,unknown>,allow:readonly string[]) {
   const keys=Reflect.ownKeys(v)
   return keys.length<=allow.length&&keys.every(k=>typeof k==='string'&&allow.includes(k)&&Object.hasOwn(Object.getOwnPropertyDescriptor(v,k)??{},'value'))
+}
+export function diagnosticCode(input:unknown):string|null {
+  if(!plain(input)||!fields(input,['version','code','severity','occurrenceTime','correlation','attributes'])||!token(input.code))return null
+  return input.code
 }
 export function validateDiagnostic(input:unknown,rule:Rule):Diagnostic|null {
   if(!plain(input)||!fields(input,['version','code','severity','occurrenceTime','correlation','attributes'])||input.version!==1||!token(input.code)||!levels.includes(input.severity as Severity)||!instant(input.occurrenceTime)||(input.correlation!==undefined&&!token(input.correlation)))return null

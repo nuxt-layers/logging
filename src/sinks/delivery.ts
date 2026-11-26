@@ -9,7 +9,7 @@ export async function deliver(sink:Sink,record:RecordEntry,timeout:number,maxAtt
     parent.addEventListener('abort',abort,{once:true})
     let timer:ReturnType<typeof setTimeout>|undefined
     try {
-      const result=await Promise.race([Promise.resolve().then(()=>sink.write(record,controller.signal)),new Promise<Delivery>(resolve=>{timer=setTimeout(()=>{controller.abort();resolve('uncertain')},timeout)})])
+      const result=await Promise.race([Promise.resolve().then(()=>controller.signal.aborted?'refused':sink.write(record,controller.signal)),new Promise<Delivery>(resolve=>{timer=setTimeout(()=>{controller.abort();resolve('uncertain')},timeout)})])
       outcome=result==='delivered'||result==='refused'?result:'uncertain'
     } catch {outcome='uncertain'}
     finally {if(timer!==undefined)clearTimeout(timer);parent.removeEventListener('abort',abort)}

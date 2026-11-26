@@ -10,7 +10,7 @@ Logging is a framework-independent technical diagnostic service. It owns sanitis
 {"@nuxt-layers/logging":"github:nuxt-layers/logging#master"}
 ```
 
-Use the accepted development revision; this document describes the proposed PR #2 interface until merged. Node 26.13+ with native TypeScript stripping is targeted. No runtime dependency is required by the core. Nuxt 4.6.4 is an optional peer target; neither runtime/package integration has yet passed acceptance. Import only from the package root or documented Nuxt subpaths.
+Use the accepted development revision; this document describes the current development interface. Node 26.13+ with native TypeScript stripping is targeted. No runtime dependency is required by the core. Nuxt 4.6.4 is an optional peer target; neither runtime/package integration has yet passed acceptance. Import only from the package root or documented Nuxt subpaths.
 
 ```ts
 import { createLogging, type Options } from '@nuxt-layers/logging'
@@ -107,7 +107,7 @@ Host responsibilities:
 Server only; no browser-facing API. The service type can be derived publicly as ReturnType<typeof createLogging<E>>. Its callable surface is:
 
 ```ts
-type QueryFailure = { status: 'rejected' | 'unavailable'; records: [] }
+type QueryFailure = { status: 'rejected' | 'unavailable'; records: never[] }
 type DiagnosticResult =
   | { status: 'completed'; records: RecordEntry[]; coverage: string }
   | QueryFailure
@@ -179,13 +179,13 @@ Acceptance is not durable persistence, remote delivery, business success or Audi
 
 RecordEntry fields: id (opaque UUID), tenantId/source (trusted scope), code/severity, occurrenceTime/receiptTime, timeQuality, optional correlation, readonly attributes, policyRevision, purpose/category and classification (technical). Records are sanitised, not raw source data.
 
-DiagnosticQuery requires tenantId, source, UTC receipt-time from/to (inclusive, max 30 days), limit 1–100. Optional offset (nonnegative integer, default 0), severity, code, correlation and id narrow results. No wildcard tenant/source or total count. Rejected means invalid query or denied access; unavailable means processing failed; completed includes coverage warning. Results are process-local, incomplete and may shift with expiry or concurrent submissions. Empty completed results are not proof that no events occurred.
+DiagnosticQuery requires tenantId, source, UTC receipt-time from/to (inclusive, max 30 days), limit 1–100. Optional offset (nonnegative integer, default 0), severity, code, correlation and id narrow results. Unexpected query fields or accessors reject. No wildcard tenant/source or total count. Rejected means invalid query or denied access; unavailable means processing failed; completed includes coverage warning. Results are process-local, incomplete and may shift with expiry or concurrent submissions. Empty completed results are not proof that no events occurred.
 
 ### Delivery and policy projections
 
 readDeliveryState uses the same query bounds, returns record IDs and per-target delivery projections. DeliveryState.target identifies local or configured destination; status delivered/exhausted/uncertain; attempts counts attempted writes (zero if skipped); time is system UTC attempt/result time, not verified Clock quality. In-flight destinations may be omitted. Explicit refusal alone permits bounded immediate retry of an external write (max three attempts). Timeout, exception or invalid sink result is uncertain; that external destination is quarantined until recomposition. Local uncertainty closes intake. No automatic restart/replay or confirmed provider deletion. External attempts are synchronous after local acknowledgement; acceptance waits for the bounded attempts.
 
-readEffectivePolicy returns the authorised scoped rules and revision, not credentials or provider secrets. Missing/invalid policy returns unavailable. It is a projection, not a policy mutation API.
+readEffectivePolicy accepts exactly tenantId and source and returns the authorised scoped rules and revision, not credentials or provider secrets. Missing/invalid policy returns unavailable. It is a projection, not a policy mutation API.
 
 hostHealth is deployment-wide and must remain at the trusted composition root: state degraded if closed/quarantined, busy if active, otherwise unknown; lastDelivery is last local acknowledgement outcome or unknown; drops counts selected admission exclusions/refusals/exhausted deliveries (not all losses); uncertain counts uncertain deliveries; buffered counts retained records; quarantined contains destination IDs. No completeness or healthy-business-process claim. Do not expose this method or aggregate data to tenant callers.
 

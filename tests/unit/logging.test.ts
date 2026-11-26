@@ -15,8 +15,10 @@ test('accepts and isolates local reads',async()=>{
  assert.equal((await service.readDiagnostics({...event,tenantId:'b'},q)).status,'rejected')
 })
 test('rejects unknown attributes before sink',async()=>{
- const service=setup({localSink:{write:async()=>{assert.fail('sink called')}}})
+ let calls=0
+ const service=setup({localSink:{write:async()=>{calls++;return 'delivered'}}})
  assert.equal((await service.submit(event,{...diagnostic,attributes:{secret:1}})).status,'rejected')
+ assert.equal(calls,0)
 })
 test('fails closed on denied producer',async()=>{
  const service=setup({decide:async()=>({allowed:false,reason:'test'})})
@@ -86,4 +88,33 @@ test('query filters and shutdown',async()=>{
 test('missing policy fails closed and invalid calendar dates reject',async()=>{
  assert.equal((await setup({resolvePolicy:async()=>null}).submit(event,diagnostic)).status,'unavailable')
  assert.equal((await setup().submit(event,{...diagnostic,occurrenceTime:'2026-02-30T00:00:00Z'})).status,'rejected')
+})
+
+test('query mutation during permission check cannot disclose another tenant',async()=>{
+ let release!:()=>void
+ let entered!:()=>void
+ const gate=new Promise<void>(r=>{release=r})
+ const ready=new Promise<void>(r=>{entered=r})
+ const service=setup({decide:async(_c,action)=>{if(action==='logging.read'){entered();await gate}return {allowed:true,reason:'test'}}})
+ await service.submit({...event,tenantId:'b'},diagnostic)
+ const q={tenantId:'a',source:'worker',from:stamp,to:stamp,limit:10}
+ const reading=service.readDiagnostics(event,q)
+ await ready
+ q.tenantId='b'
+ release()
+ assert.equal((await reading).records.length,0)
+})
+test('diagnostic accessor is rejected without invocation',async()=>{
+ let calls=0
+ const input={...diagnostic}
+ Object.defineProperty(input,'code',{get(){calls++;return 'worker.done'},enumerable:true})
+ assert.equal((await setup().submit(event,input)).status,'rejected')
+ assert.equal(calls,0)
+})
+test('timeout is uncertain and does not retry',async()=>{
+ let calls=0
+ const service=setup({timeoutMs:5,localSink:{write:async()=>{calls++;return new Promise(()=>{})}}})
+ assert.equal((await service.submit(event,diagnostic)).status,'uncertain')
+ assert.equal((await service.submit(event,diagnostic)).status,'unavailable')
+ assert.equal(calls,1)
 })

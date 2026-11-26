@@ -17,7 +17,9 @@
   },
   "scripts": {
     "test": "node --test tests/unit/*.test.ts tests/integration/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:contract": "node scripts/check-contract.mjs",
+    "check:composition": "node scripts/check-composition.mjs"
   },
   "devDependencies": {
     "typescript": "6.0.3"

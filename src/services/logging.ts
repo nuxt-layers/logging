@@ -1,5 +1,5 @@
-import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, Rule, Severity, DiagnosticQuery, DeliveryState, Policy } from '../contracts/types.ts'
-import { token, instant, bounded, levels, compileRules, effectiveRules, validateDiagnostic } from '../policy/validation.ts'
+import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy } from '../contracts/types.ts'
+import { token, instant, bounded, levels, compileRules, effectiveRules, validateDiagnostic, diagnosticCode, plain, fields } from '../policy/validation.ts'
 import { deliver } from '../sinks/delivery.ts'
 
 export function createLogging<E>(options: Options<E>) {
@@ -8,6 +8,8 @@ export function createLogging<E>(options: Options<E>) {
   const timeout = options.timeoutMs ?? 1000
   const retention = options.retentionMs
   const revision = options.policyRevision
+  // Snapshot provider references; callers must not mutate a composed trust boundary.
+  options = {...options}
   const localSink = options.localSink
   if (!bounded(capacity,10000) || !bounded(rate,10000) || !bounded(timeout,30000) || !bounded(retention,86400000*30) || !token(revision) || !localSink || typeof localSink.write !== 'function') throw new Error('LOG_INVALID_CONFIG')
   const external = new Map<string,{sink:typeof localSink;maxAttempts:number}>()
@@ -57,7 +59,9 @@ export function createLogging<E>(options: Options<E>) {
       if(!producer || !token(producer.tenantId) || !token(producer.source) || (await options.decide(producer,'logging.submit',{tenantId:producer.tenantId,source:producer.source})).allowed!==true) return {status:'rejected',code:'LOG_DENIED'}
       const p=await policy(producer.tenantId,producer.source)
       if(!p) return {status:'unavailable',code:'LOG_POLICY_UNAVAILABLE'}
-      const rule=p.rules.find(r=>r.source===producer.source && r.code===input?.code)
+      const code=diagnosticCode(input)
+      if(!code) return {status:'rejected',code:'LOG_INVALID'}
+      const rule=p.rules.find(r=>r.source===producer.source && r.code===code)
       if(!rule) return {status:'rejected',code:'LOG_RULE'}
       const d=validateDiagnostic(input,rule)
       if(!d) return {status:'rejected',code:'LOG_INVALID'}
@@ -102,6 +106,10 @@ export function createLogging<E>(options: Options<E>) {
     active=task
     return task
   }
+  function snapshotQuery(q:DiagnosticQuery):DiagnosticQuery|null {
+    if(!plain(q)||!fields(q,['tenantId','source','from','to','limit','offset','severity','code','correlation','id']))return null
+    return {...q}
+  }
   function validQuery(q:DiagnosticQuery) {
     return !!q && token(q.tenantId)&&token(q.source)&&instant(q.from)&&instant(q.to)&&bounded(q.limit,100)&&Number.isSafeInteger(q.offset??0)&&(q.offset??0)>=0&&Date.parse(q.to)>=Date.parse(q.from)&&Date.parse(q.to)-Date.parse(q.from)<=86400000*30&&(q.severity===undefined||levels.includes(q.severity))&&(q.code===undefined||token(q.code))&&(q.correlation===undefined||token(q.correlation))&&(q.id===undefined||token(q.id))
   }
@@ -109,26 +117,30 @@ export function createLogging<E>(options: Options<E>) {
     return r.tenantId===q.tenantId&&r.source===q.source&&Date.parse(r.receiptTime)>=Date.parse(q.from)&&Date.parse(r.receiptTime)<=Date.parse(q.to)&&(q.severity===undefined||r.severity===q.severity)&&(q.code===undefined||r.code===q.code)&&(q.correlation===undefined||r.correlation===q.correlation)&&(q.id===undefined||r.id===q.id)
   }
   async function readDiagnostics(event:E,query:DiagnosticQuery) {
-    if(!validQuery(query)||!await authorised(event,'logging.read',query.tenantId,query.source)) return {status:'rejected' as const,records:[]}
+    const snapshot=snapshotQuery(query)
+    if(!snapshot||!validQuery(snapshot)||!await authorised(event,'logging.read',snapshot.tenantId,snapshot.source)) return {status:'rejected' as const,records:[]}
     try {
       expire(time().ms)
-      const offset=query.offset??0
-      const records=rows.filter(x=>matches(query,x.record)).slice(offset,offset+query.limit).map(x=>x.record)
+      const offset=snapshot.offset??0
+      const records=rows.filter(x=>matches(snapshot,x.record)).slice(offset,offset+snapshot.limit).map(x=>x.record)
       return {status:'completed' as const,records,coverage:'process-local; incomplete; pagination may shift' as const}
     } catch {return {status:'unavailable' as const,records:[]}}
   }
   async function readDeliveryState(event:E,query:DiagnosticQuery) {
-    if(!validQuery(query)||!await authorised(event,'logging.delivery.read',query.tenantId,query.source)) return {status:'rejected' as const,records:[]}
+    const snapshot=snapshotQuery(query)
+    if(!snapshot||!validQuery(snapshot)||!await authorised(event,'logging.delivery.read',snapshot.tenantId,snapshot.source)) return {status:'rejected' as const,records:[]}
     try {
       expire(time().ms)
-      const offset=query.offset??0
-      return {status:'completed' as const,records:rows.filter(x=>matches(query,x.record)).slice(offset,offset+query.limit).map(x=>({id:x.record.id,delivery:x.delivery.map(d=>({...d}))})),coverage:'process-local; incomplete; in-flight destinations may be omitted' as const}
+      const offset=snapshot.offset??0
+      return {status:'completed' as const,records:rows.filter(x=>matches(snapshot,x.record)).slice(offset,offset+snapshot.limit).map(x=>({id:x.record.id,delivery:x.delivery.map(d=>({...d}))})),coverage:'process-local; incomplete; in-flight destinations may be omitted' as const}
     } catch {return {status:'unavailable' as const,records:[]}}
   }
   async function readEffectivePolicy(event:E,scope:{tenantId:string;source:string}) {
-    if(!scope||!await authorised(event,'logging.policy.read',scope.tenantId,scope.source)) return {status:'rejected' as const}
+    if(!plain(scope)||!fields(scope,['tenantId','source'])||!token(scope.tenantId)||!token(scope.source))return {status:'rejected' as const}
+    const {tenantId,source}=scope
+    if(!await authorised(event,'logging.policy.read',tenantId,source)) return {status:'rejected' as const}
     try {
-      const p=await policy(scope.tenantId,scope.source)
+      const p=await policy(tenantId,source)
       return p?{status:'completed' as const,policy:structuredClone(p)}:{status:'unavailable' as const}
     } catch {return {status:'unavailable' as const}}
   }
@@ -145,5 +157,5 @@ export function createLogging<E>(options: Options<E>) {
       return await Promise.race([pending.then(()=>({status:'completed' as const})),new Promise<{status:'uncertain'}>(resolve=>{timer=setTimeout(()=>resolve({status:'uncertain'}),timeout)})])
     } finally {if(timer!==undefined)clearTimeout(timer)}
   }
-  return {submit,readDiagnostics,readDeliveryState,readEffectivePolicy,hostHealth:()=>({state:closed||quarantined.size?'degraded':busy?'busy':'unknown',lastDelivery,drops,uncertain,buffered:rows.length,quarantined:[...quarantined]}),close,shutdown}
+  return {submit,readDiagnostics,readDeliveryState,readEffectivePolicy,hostHealth:()=>({state:closed||quarantined.size?'degraded' as const:busy?'busy' as const:'unknown' as const,lastDelivery,drops,uncertain,buffered:rows.length,quarantined:[...quarantined]}),close,shutdown}
 }
