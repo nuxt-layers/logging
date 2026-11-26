@@ -1,0 +1,5 @@
+# Protected lifecycle specification
+
+LOG-06/08, ADR-0017/18. Batch 03 stacked on PR #2 e0d72987d04574c28bd318b3ba0051b7192c7678. Local cache projection is not durable custody. Provide scoped health and protected bounded export, exact-record restriction and erasure. Affirmative resource permission plus independent approval evidence required; recheck permission after approval. Erasure requires clear preservation; held and unknown block. No global deletion assertion. No restricted projection in reads/export/health. Serialize privileged commands with intake. Request IDs are correlation only.
+
+Outstanding: durable Logging-owned state and transactional outbox, provider-qualified retention/hold/restriction/erasure/recovery, committed lifecycle events, independent provider integration, privileged policy mutation, complete health and acceptance. The approval port is not an implemented Audit/Privacy/Legal Compliance integration. No actual provider contract or persistence API is invented. No tests/builds executed by AI.

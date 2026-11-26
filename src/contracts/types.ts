@@ -11,6 +11,23 @@ export type DiagnosticQuery = { tenantId:string; source:string; from:string; to:
 export type Policy = { revision:string; rules:readonly Rule[] }
 export type ExternalSink = { id:string; sink:Sink; maxAttempts?:number }
 export type DeliveryState = { target:string; status:'delivered'|'exhausted'|'uncertain'; attempts:number; time:string }
+export type LifecycleAction = 'export' | 'erase' | 'restrict'
+export type LifecycleTarget = { tenantId:string; source:string; id:string }
+export type LifecycleApproval = {
+  action:LifecycleAction
+  caller:Caller
+  requestId:string
+  target:LifecycleTarget | DiagnosticQuery
+}
+export type LifecycleDecision =
+  | { status:'approved'; evidenceRef:string; preservation:'clear'|'held'|'unknown' }
+  | { status:'blocked'|'unknown' }
+export type LifecycleResult =
+  | { status:'completed-local'; requestId:string; evidenceRef:string; providerState:'unknown' }
+  | { status:'blocked'|'rejected'|'unavailable'|'uncertain' }
+export type ExportResult =
+  | { status:'completed-local'; requestId:string; evidenceRef:string; records:RecordEntry[]; coverage:string }
+  | { status:'blocked'|'rejected'|'unavailable'|'uncertain'; records:never[] }
 export type Options<E> = {
   resolveCaller(event: E): Promise<Caller | null>
   resolveProducer(event: E): Promise<Producer | null>
@@ -24,5 +41,6 @@ export type Options<E> = {
   ratePerMinute?: number
   timeoutMs?: number
   externalSinks?: readonly ExternalSink[]
+  approveLifecycle?: (request:LifecycleApproval) => Promise<LifecycleDecision>
   resolvePolicy?: (scope:{tenantId:string;source:string}) => Promise<Policy | null>
 }

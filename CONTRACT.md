@@ -57,7 +57,10 @@ The named artefacts identify conceptual owners, not mandatory package imports or
 | Diagnostic and delivery query | Authorised consumers | readDiagnostics / readDeliveryState | Implemented |
 | Effective policy query | Authorised administrators | readEffectivePolicy | Implemented |
 | Shutdown | Composition root | close / shutdown | Implemented |
-| Privileged policy change, export, restriction, erasure, hold and recovery commands | Authorised operators, Privacy, Legal Compliance | No callable API | Approved; unavailable |
+| Local export, restriction and erasure requests | Authorised operators, Privacy, Legal Compliance | exportDiagnostics / restrictDiagnostic / eraseDiagnostic | Implemented, local projection only |
+| Independent lifecycle approval and preservation decision | Host-composed qualified authorities | approveLifecycle | Optional implemented port; missing blocks commands |
+| Scoped pipeline health query | Authorised operators / Observability | readPipelineHealth | Implemented, retained records only |
+| Privileged policy change, provider rights/hold/recovery commands | Authorised operators, Privacy, Legal Compliance | No callable API | Approved; unavailable |
 
 The following are the exported TypeScript input and output types (package root):
 
@@ -75,6 +78,23 @@ export type DiagnosticQuery = { tenantId:string; source:string; from:string; to:
 export type Policy = { revision:string; rules:readonly Rule[] }
 export type ExternalSink = { id:string; sink:Sink; maxAttempts?:number }
 export type DeliveryState = { target:string; status:'delivered'|'exhausted'|'uncertain'; attempts:number; time:string }
+export type LifecycleAction = 'export' | 'erase' | 'restrict'
+export type LifecycleTarget = { tenantId:string; source:string; id:string }
+export type LifecycleApproval = {
+  action:LifecycleAction
+  caller:Caller
+  requestId:string
+  target:LifecycleTarget | DiagnosticQuery
+}
+export type LifecycleDecision =
+  | { status:'approved'; evidenceRef:string; preservation:'clear'|'held'|'unknown' }
+  | { status:'blocked'|'unknown' }
+export type LifecycleResult =
+  | { status:'completed-local'; requestId:string; evidenceRef:string; providerState:'unknown' }
+  | { status:'blocked'|'rejected'|'unavailable'|'uncertain' }
+export type ExportResult =
+  | { status:'completed-local'; requestId:string; evidenceRef:string; records:RecordEntry[]; coverage:string }
+  | { status:'blocked'|'rejected'|'unavailable'|'uncertain'; records:never[] }
 export type Options<E> = {
   resolveCaller(event: E): Promise<Caller | null>
   resolveProducer(event: E): Promise<Producer | null>
@@ -88,6 +108,7 @@ export type Options<E> = {
   ratePerMinute?: number
   timeoutMs?: number
   externalSinks?: readonly ExternalSink[]
+  approveLifecycle?: (request:LifecycleApproval) => Promise<LifecycleDecision>
   resolvePolicy?: (scope:{tenantId:string;source:string}) => Promise<Policy | null>
 }
 ```
@@ -131,6 +152,12 @@ interface LoggingSurface<E> {
   readDiagnostics(event: E, query: DiagnosticQuery): Promise<DiagnosticResult>
   readDeliveryState(event: E, query: DiagnosticQuery): Promise<DeliveryResult>
   readEffectivePolicy(event: E, scope: {tenantId:string;source:string}): Promise<PolicyResult>
+  readPipelineHealth(event: E, query: DiagnosticQuery): Promise<
+    {status:'completed';records:number;delivered:number;exhausted:number;uncertain:number;coverage:string}
+    | {status:'rejected'|'unavailable'}>
+  exportDiagnostics(event:E,query:DiagnosticQuery,requestId:string):Promise<ExportResult>
+  eraseDiagnostic(event:E,target:LifecycleTarget,requestId:string):Promise<LifecycleResult>
+  restrictDiagnostic(event:E,target:LifecycleTarget,requestId:string):Promise<LifecycleResult>
   hostHealth(): HostHealth
   close(): void
   shutdown(): Promise<{status:'completed'|'uncertain'}>
@@ -148,8 +175,9 @@ interface LoggingSurface<E> {
 | Effective policy projection | Authorised administrators | readEffectivePolicy | Implemented |
 | Deployment pipeline health | Trusted composition root | hostHealth | Implemented, not tenant-scoped |
 | Shutdown result | Composition root | shutdown | Implemented |
-| Scoped aggregate pipeline health | Authorised operators / Observability | No callable API | Approved; unavailable |
-| Export, retention, restriction, erasure and recovery outcomes | Authorised operators / Privacy / Legal Compliance | No callable API | Approved; unavailable |
+| Scoped retained-record health | Authorised operators / Observability | readPipelineHealth | Implemented, incomplete |
+| Local export, restriction and erasure outcomes | Authorised operators / Privacy / Legal Compliance | exportDiagnostics / restrictDiagnostic / eraseDiagnostic | Implemented, not provider custody |
+| Provider retention/hold/rights/recovery outcomes | Authorised operators / Privacy / Legal Compliance | No callable API | Approved; unavailable |
 | Committed lifecycle events | Audit / Observability | No event or relay API | Approved; unavailable |
 
 ### Diagnostic intake
@@ -191,6 +219,16 @@ hostHealth is deployment-wide and must remain at the trusted composition root: s
 
 close stops intake, signals abort and clears local history/rate buckets. shutdown additionally waits up to timeoutMs for the active submission, returning completed if settled or uncertain if wait expired. Neither proves provider deletion or cancellation. Host must bound caller/policy provider latency.
 
+### Protected local lifecycle and health
+
+approveLifecycle is an optional host-supplied port. It receives the action, authenticated human subject/caller, opaque requestId and exact tenant/source target or query. The host must independently establish appropriate assurance, current authority, purpose, attributable evidence and applicable preservation obligations, then return approved with an opaque evidenceRef and clear/held/unknown preservation, or blocked/unknown. Never fabricate an approval. Missing, malformed or failed approval blocks execution. The approval reference is not a committed Audit receipt. No real provider integration is asserted.
+
+exportDiagnostics accepts the same bounded query as readDiagnostics, plus requestId. Returns completed-local with records and evidence reference, or rejected/blocked/unavailable/uncertain and empty records. It excludes restricted records. This is a bounded in-memory projection, not a portable export from every sink. Recheck permission after approval before disclosure.
+
+eraseDiagnostic and restrictDiagnostic accept exact tenantId/source/id plus requestId. Erasure requires explicit clear preservation; held blocks and unknown fails closed. Restriction hides the retained record from reads, exports, delivery projections and scoped health. Recheck permission after approval. completed-local means the local projection was removed or hidden, or was already absent; no existence oracle or provider deletion confirmation. providerState is always unknown. No durable restriction or legal-hold enforcement across sinks, restarts or cache expiry; do not use this for regulated rights fulfilment. Request IDs support correlation only, not durable idempotency; repeat requests require independent approval again. Privileged operations serialize with intake; busy returns unavailable. Shutdown does not wait for approval ports; no local change follows a closed instance.
+
+readPipelineHealth uses the same validated tenant/source/time/filter query and separate permission. Returns completed with retained record count and delivered/exhausted/uncertain destination counts, or rejected/unavailable. Pagination is ignored for aggregates; limit is still required. Counts exclude restricted, expired, refused-before-retention and unobserved records; no global loss or coverage claim.
+
 ## Permissions
 
 | Action | Resource | Risk/effect |
@@ -199,8 +237,12 @@ close stops intake, signals abort and clears local history/rate buckets. shutdow
 | logging.read | Requested tenantId/source | Reveal sanitised diagnostic records |
 | logging.delivery.read | Requested tenantId/source | Reveal scoped delivery state |
 | logging.policy.read | Requested tenantId/source | Reveal scoped effective policy |
+| logging.health.read | Requested tenantId/source | Reveal retained-record aggregates |
+| logging.export | Requested tenantId/source | Protected local diagnostic disclosure |
+| logging.erase | Requested tenantId/source | Remove local projection; clear preservation required |
+| logging.restrict | Requested tenantId/source | Hide local projection |
 
-All require affirmative server-side resource decisions; queries require matching trusted tenant before lookup. Separate permissions are not interchangeable. hostHealth, close and shutdown are composition-root-only, not user-facing permissions. No cross-tenant override or privilege bypass. Future protected commands require separate permissions and independent evidence; none are exposed now.
+All require affirmative server-side resource decisions; queries require matching trusted tenant before lookup. Separate permissions are not interchangeable. hostHealth, close and shutdown are composition-root-only, not user-facing permissions. No cross-tenant override or privilege bypass. Local protected commands additionally require independently attributable approval. Provider-level rights and privileged policy mutation remain unavailable.
 
 ## Screens
 
@@ -214,9 +256,9 @@ In one host Nitro plugin, import provideLogging, getLogging and closeLogging fro
 
 ## Headless surface
 
-Implemented: validated diagnostic admission, sanitised sink output, scoped reads, delivery projection, effective policy projection, host health and shutdown. These work without a GUI, Nuxt or external destinations. No mandatory database.
+Implemented: validated diagnostic admission, sanitised sink output, scoped reads, delivery projection, effective policy projection, scoped retained-record health, protected local export/restriction/erasure, host health and shutdown. These work without a GUI, Nuxt or external destinations. No mandatory database.
 
-Approved but unavailable: governed privileged policy mutations, protected export, retention/hold/restriction/erasure commands and results, scoped aggregate health, committed lifecycle events and durable outbox/relay, persistent recovery and manual retry. Do not call invented methods or substitute Logging receipts for Audit evidence. Missing provider contracts must be reconciled before claiming those integrations.
+Approved but unavailable: governed privileged policy mutations, durable/provider export, retention/hold/restriction/erasure commands and results, complete scoped loss/backlog health, committed lifecycle events and durable outbox/relay, persistent recovery and manual retry. Do not call invented methods or substitute Logging receipts for Audit evidence. Missing provider contracts must be reconciled before claiming those integrations.
 
 ## You will hit this
 
