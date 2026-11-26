@@ -36,6 +36,18 @@ export type LifecycleCommit = {
   action:'restrict'|'erase'; target:LifecycleTarget; requestId:string; subjectId:string;
   evidenceRef:string; committedAt:string
 }
+export type StoredDiagnostic = { record:RecordEntry; delivery:DeliveryState[] }
+export type DiagnosticStore = LifecycleJournal & {
+  save(entry:StoredDiagnostic,capacity:number):Promise<'stored'|'full'|'uncertain'>
+  load(tenantId:string,source:string,limit:number):Promise<StoredDiagnostic[]>
+  updateDelivery(target:LifecycleTarget,delivery:DeliveryState[]):Promise<void>
+  expired(before:string,limit:number):Promise<LifecycleTarget[]>
+  expire(target:LifecycleTarget,before:string):Promise<'removed'|'absent'>
+}
+export type PreservationDecision = 'clear'|'held'|'unknown'
+export type OptionsRetention = {
+  resolvePreservation(target:LifecycleTarget):Promise<PreservationDecision>
+}
 export type LifecycleJournal = {
   commit(command:LifecycleCommit):Promise<'committed'|'duplicate'|'conflict'|'uncertain'>
   visibility(target:LifecycleTarget):Promise<'visible'|'restricted'|'erased'>
@@ -57,6 +69,8 @@ export type Options<E> = {
   timeoutMs?: number
   externalSinks?: readonly ExternalSink[]
   lifecycleJournal?: LifecycleJournal
+  diagnosticStore?: DiagnosticStore
+  retentionAuthority?: OptionsRetention
   approveLifecycle?: (request:LifecycleApproval) => Promise<LifecycleDecision>
   resolvePolicy?: (scope:{tenantId:string;source:string}) => Promise<Policy | null>
 }

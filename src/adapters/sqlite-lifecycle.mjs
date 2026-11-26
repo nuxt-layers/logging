@@ -11,6 +11,12 @@ export function createSqliteLifecycleJournal(path) {
       PRAGMA journal_mode=WAL;
       PRAGMA synchronous=FULL;
       PRAGMA busy_timeout=1000;
+      CREATE TABLE IF NOT EXISTS logging_diagnostics (
+        tenant TEXT NOT NULL, source TEXT NOT NULL, record TEXT NOT NULL,
+        receipt INTEGER NOT NULL, payload TEXT NOT NULL, delivery TEXT NOT NULL,
+        PRIMARY KEY(tenant,source,record)
+      );
+      CREATE INDEX IF NOT EXISTS logging_diagnostics_expiry ON logging_diagnostics(receipt);
       CREATE TABLE IF NOT EXISTS logging_lifecycle (
         tenant TEXT NOT NULL, source TEXT NOT NULL, record TEXT NOT NULL,
         state TEXT NOT NULL CHECK(state IN ('restricted','erased')),
@@ -36,6 +42,36 @@ export function createSqliteLifecycleJournal(path) {
   const pending = db.prepare('SELECT payload FROM logging_outbox WHERE acknowledged=0 ORDER BY seq LIMIT ?')
   const acknowledge = db.prepare('UPDATE logging_outbox SET acknowledged=1 WHERE id=?')
   return {
+    async save(entry,capacity) {
+      if(!Number.isSafeInteger(capacity)||capacity<1||capacity>10000)return 'uncertain'
+      const r=entry.record
+      try {
+        db.exec('BEGIN IMMEDIATE')
+        if(db.prepare('SELECT COUNT(*) AS n FROM logging_diagnostics').get().n>=capacity) {
+          db.exec('ROLLBACK');return 'full'
+        }
+        if(state.get(r.tenantId,r.source,r.id)){db.exec('ROLLBACK');return 'uncertain'}
+        db.prepare('INSERT INTO logging_diagnostics VALUES(?,?,?,?,?,?)').run(r.tenantId,r.source,r.id,Date.parse(r.receiptTime),JSON.stringify(r),JSON.stringify(entry.delivery))
+        db.exec('COMMIT');return 'stored'
+      } catch {try{db.exec('ROLLBACK')}catch{}return 'uncertain'}
+    },
+    async load(tenantId,source,limit) {
+      if(!Number.isSafeInteger(limit)||limit<1||limit>10000)throw new Error('LOG_INVALID_LIMIT')
+      return db.prepare(`SELECT d.payload,d.delivery FROM logging_diagnostics d
+        LEFT JOIN logging_lifecycle l ON d.tenant=l.tenant AND d.source=l.source AND d.record=l.record
+        WHERE d.tenant=? AND d.source=? AND l.state IS NULL ORDER BY d.receipt,d.record LIMIT ?`).all(tenantId,source,limit).map(row=>({record:JSON.parse(row.payload),delivery:JSON.parse(row.delivery)}))
+    },
+    async updateDelivery(target,delivery) {
+      db.prepare('UPDATE logging_diagnostics SET delivery=? WHERE tenant=? AND source=? AND record=?').run(JSON.stringify(delivery),target.tenantId,target.source,target.id)
+    },
+    async expired(before,limit) {
+      if(!Number.isSafeInteger(limit)||limit<1||limit>100||!Number.isFinite(Date.parse(before)))throw new Error('LOG_INVALID_LIMIT')
+      return db.prepare('SELECT tenant AS tenantId,source,record AS id FROM logging_diagnostics WHERE receipt<=? ORDER BY receipt,tenant,source,record LIMIT ?').all(Date.parse(before),limit)
+    },
+    async expire(target,before) {
+      const result=db.prepare('DELETE FROM logging_diagnostics WHERE tenant=? AND source=? AND record=? AND receipt<=?').run(target.tenantId,target.source,target.id,Date.parse(before))
+      return result.changes?'removed':'absent'
+    },
     async commit(command) {
       const {action,target,requestId,subjectId,evidenceRef,committedAt}=command
       const {tenantId,source,id}=target
@@ -54,6 +90,7 @@ export function createSqliteLifecycleJournal(path) {
         }
         const event={version:1,id:randomUUID(),type:action==='erase'?'logging.erased':'logging.restricted',tenantId,source,recordId:id,requestId,subjectId,evidenceRef,committedAt}
         mutate.run(tenantId,source,id,action==='erase'?'erased':'restricted')
+        if(action==='erase')db.prepare('DELETE FROM logging_diagnostics WHERE tenant=? AND source=? AND record=?').run(tenantId,source,id)
         insertRequest.run(tenantId,source,requestId,fingerprint)
         insertEvent.run(event.id,JSON.stringify(event))
         db.exec('COMMIT')

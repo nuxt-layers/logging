@@ -58,6 +58,8 @@ The named artefacts identify conceptual owners, not mandatory package imports or
 | Effective policy query | Authorised administrators | readEffectivePolicy | Implemented |
 | Shutdown | Composition root | close / shutdown | Implemented |
 | Local export, restriction and erasure requests | Authorised operators, Privacy, Legal Compliance | exportDiagnostics / restrictDiagnostic / eraseDiagnostic | Implemented, local projection only |
+| Durable diagnostic persistence | Host-composed Logging-owned store | diagnosticStore | Optional implemented port; SQLite adapter |
+| Preservation decision for maintenance | Qualified host authority | retentionAuthority.resolvePreservation | Optional; missing prevents maintenance |
 | Durable lifecycle state and outbox | Host-composed Logging-owned journal | lifecycleJournal | Optional implemented port; SQLite adapter provided |
 | Independent lifecycle approval and preservation decision | Host-composed qualified authorities | approveLifecycle | Optional implemented port; missing blocks commands |
 | Scoped pipeline health query | Authorised operators / Observability | readPipelineHealth | Implemented, retained records only |
@@ -104,6 +106,18 @@ export type LifecycleCommit = {
   action:'restrict'|'erase'; target:LifecycleTarget; requestId:string; subjectId:string;
   evidenceRef:string; committedAt:string
 }
+export type StoredDiagnostic = { record:RecordEntry; delivery:DeliveryState[] }
+export type DiagnosticStore = LifecycleJournal & {
+  save(entry:StoredDiagnostic,capacity:number):Promise<'stored'|'full'|'uncertain'>
+  load(tenantId:string,source:string,limit:number):Promise<StoredDiagnostic[]>
+  updateDelivery(target:LifecycleTarget,delivery:DeliveryState[]):Promise<void>
+  expired(before:string,limit:number):Promise<LifecycleTarget[]>
+  expire(target:LifecycleTarget,before:string):Promise<'removed'|'absent'>
+}
+export type PreservationDecision = 'clear'|'held'|'unknown'
+export type OptionsRetention = {
+  resolvePreservation(target:LifecycleTarget):Promise<PreservationDecision>
+}
 export type LifecycleJournal = {
   commit(command:LifecycleCommit):Promise<'committed'|'duplicate'|'conflict'|'uncertain'>
   visibility(target:LifecycleTarget):Promise<'visible'|'restricted'|'erased'>
@@ -125,6 +139,8 @@ export type Options<E> = {
   timeoutMs?: number
   externalSinks?: readonly ExternalSink[]
   lifecycleJournal?: LifecycleJournal
+  diagnosticStore?: DiagnosticStore
+  retentionAuthority?: OptionsRetention
   approveLifecycle?: (request:LifecycleApproval) => Promise<LifecycleDecision>
   resolvePolicy?: (scope:{tenantId:string;source:string}) => Promise<Policy | null>
 }
@@ -175,6 +191,7 @@ interface LoggingSurface<E> {
   exportDiagnostics(event:E,query:DiagnosticQuery,requestId:string):Promise<ExportResult>
   eraseDiagnostic(event:E,target:LifecycleTarget,requestId:string):Promise<LifecycleResult>
   restrictDiagnostic(event:E,target:LifecycleTarget,requestId:string):Promise<LifecycleResult>
+  maintainRetention(limit?:number):Promise<{status:'completed'|'unavailable'|'uncertain';removed:number;held:number}>
   relayLifecycle(publish:LifecyclePublisher,limit?:number):Promise<{status:'completed'|'unavailable'|'uncertain';published:number}>
   hostHealth(): HostHealth
   close(): void
@@ -217,6 +234,7 @@ Receipt.status and code:
 | unavailable | LOG_POLICY_UNAVAILABLE | Effective policy missing |
 | unavailable | LOG_SINK_REFUSED | Local sink confirmed no write |
 | unavailable | LOG_PROVIDER | Provider, clock, policy validation or processing error |
+| uncertain | LOG_STORE_UNCERTAIN | Durable record or delivery state may have committed; intake closes |
 | uncertain | LOG_SINK_UNCERTAIN | Local write may have occurred; id supplied; intake closes |
 
 Acceptance is not durable persistence, remote delivery, business success or Audit custody. A provider error does not establish that no effect occurred. Producer retries can duplicate records; no idempotency guarantee.
@@ -251,9 +269,15 @@ readPipelineHealth uses the same validated tenant/source/time/filter query and s
 
 Import createSqliteLifecycleJournal(path) from '@nuxt-layers/logging/sqlite' and pass it as lifecycleJournal in Options. This optional Node adapter uses node:sqlite, a persistent host-selected file, WAL and FULL synchronous commits. The host owns file permissions, storage location, backup, retention and close. Do not share the file with unrelated capabilities. No database is required for ordinary diagnostic intake.
 
-The journal atomically commits restriction/erasure state, request identity and a version-1 lifecycle event. Duplicate tenant/source/request with identical action, target, subject and evidence reference is idempotent; changed content is conflict (rejected). Erasure is terminal for that record ID; a subsequent restriction request conflicts. A committed result means the Logging-owned lifecycle state and event committed, not external sink deletion; providerState remains unknown. Uncertain commit closes intake and clears local history; recompose and reconcile via the durable journal. All diagnostic projections check journal visibility; lookup errors fail closed (internal LOG_JOURNAL, surfaced as unavailable). Diagnostic records themselves remain process-local, not recovered from this journal. Existing holds still require independent preservation approval; journal is not the legal authority.
+The journal atomically commits restriction/erasure state, request identity and a version-1 lifecycle event. Duplicate tenant/source/request with identical action, target, subject and evidence reference is idempotent; changed content is conflict (rejected). Erasure is terminal for that record ID; a subsequent restriction request conflicts. A committed result means the Logging-owned lifecycle state and event committed, not external sink deletion; providerState remains unknown. Uncertain commit closes intake and clears local history; recompose and reconcile via the durable journal. All diagnostic projections check journal visibility; lookup errors fail closed (internal LOG_JOURNAL, surfaced as unavailable). When configured as diagnosticStore (rather than lifecycleJournal alone), the same adapter persists sanitised diagnostic records and delivery projections. Existing holds still require independent preservation approval; journal is not the legal authority.
 
 LifecycleEvent contains stable ID, version, event type, tenant/source, opaque record/request/subject/evidence references and commit UTC. No diagnostic payload. Events describe committed Logging state only, not Audit custody or provider erasure. Host must classify references and restrict event recipients. relayLifecycle(publish, limit=20) is a composition-root-only pull/ack operation, max 100, one relay in flight per instance. Publisher returns delivered only after durable downstream acknowledgement. Refusal or uncertainty leaves the event pending; acknowledgement failure may duplicate delivery. Consumers deduplicate on event ID. Host schedules relay and must use a single active relay per journal; no distributed lease or automatic retries. Acknowledged events and request/tombstone state are retained until a governed retention mechanism is implemented; bounded relay batches do not bound database growth. No Message Queue integration is presumed. Host bounds journal operations and closes the adapter after all work settles.
+
+### Optional diagnostic persistence and retention maintenance
+
+Pass createSqliteLifecycleJournal(path) as diagnosticStore; it also supplies the lifecycle journal. A different lifecycleJournal alongside it is rejected. The store commits the sanitised envelope before sink invocation and persists observed delivery outcomes. Recovered records are read directly from the scoped store, not replayed to sinks. Empty/incomplete delivery arrays mean no confirmed result was persisted, not successful delivery. A refused or uncertain sink may still leave a diagnostic record. Store uncertainty closes intake; recompose and investigate. The capacity limit applies to persisted records across tenants; held records consume capacity, no silent eviction. Host must use one active service writer per store and coordinate provider/disclosure operations. Store is trusted infrastructure; validate its implementation before deployment.
+
+Ordinary projections exclude records older than retentionMs even when preserved in storage. maintainRetention(limit=20) is composition-root-only, max 100 per call; verified clock and a qualified retentionAuthority are required. Explicit clear permits deletion from Logging's own diagnostic store; held/unknown are retained. No automatic maintenance, provider erasure, legal-authority or physical-media deletion guarantee. Host must ensure preservation decisions remain valid through deletion and coordinate concurrent hold changes. Old held records may occupy the bounded maintenance scan; the host must reconcile them. Journal tombstones, request fingerprints and events are not deleted by diagnostic retention. Purpose-specific rules, governed journal compaction and provider-level lifecycle remain outstanding.
 
 ## Permissions
 
@@ -268,7 +292,7 @@ LifecycleEvent contains stable ID, version, event type, tenant/source, opaque re
 | logging.erase | Requested tenantId/source | Remove local projection; clear preservation required |
 | logging.restrict | Requested tenantId/source | Hide local projection |
 
-All require affirmative server-side resource decisions; queries require matching trusted tenant before lookup. Separate permissions are not interchangeable. hostHealth, close and shutdown are composition-root-only, not user-facing permissions. No cross-tenant override or privilege bypass. Local protected commands additionally require independently attributable approval. Provider-level rights and privileged policy mutation remain unavailable. relayLifecycle is composition-root-only.
+All require affirmative server-side resource decisions; queries require matching trusted tenant before lookup. Separate permissions are not interchangeable. hostHealth, close and shutdown are composition-root-only, not user-facing permissions. No cross-tenant override or privilege bypass. Local protected commands additionally require independently attributable approval. Provider-level rights and privileged policy mutation remain unavailable. relayLifecycle and maintainRetention are composition-root-only.
 
 ## Screens
 
@@ -284,10 +308,10 @@ In one host Nitro plugin, import provideLogging, getLogging and closeLogging fro
 
 Implemented: validated diagnostic admission, sanitised sink output, scoped reads, delivery projection, effective policy projection, scoped retained-record health, protected local export/restriction/erasure, host health and shutdown. These work without a GUI, Nuxt or external destinations. No mandatory database.
 
-Approved but unavailable: governed privileged policy mutations, durable/provider export, retention/hold/restriction/erasure commands and results, complete scoped loss/backlog health, committed lifecycle events for other operations, durable diagnostic record recovery and manual retry. Do not call invented methods or substitute Logging receipts for Audit evidence. Missing provider contracts must be reconciled before claiming those integrations.
+Approved but unavailable: governed privileged policy mutations, provider-wide export, retention/hold/restriction/erasure commands and results, complete scoped loss/backlog health, committed lifecycle events for other operations, automatic replay/reconciliation of uncertain sink writes and manual retry. Do not call invented methods or substitute Logging receipts for Audit evidence. Missing provider contracts must be reconciled before claiming those integrations.
 
 ## You will hit this
 
-Identifiers use ASCII alphanumeric first character, then up to 95 alphanumeric/underscore/dot/colon/hyphen characters. Syntax is not proof of safe provenance. UTC timestamps use YYYY-MM-DDTHH:mm:ss[.SSS]Z with 1–3 optional fractional digits. Only one submission in flight; concurrent calls receive unavailable. Policy sampling uses the tenant/source minute admission counter. Expiry is lazy on submit/read; history is not durable and provider retention is independent. Shutdown and local uncertainty do not prove write reversal. Never use this subset for regulated retention, evidence custody or legal hold fulfilment.
+Identifiers use ASCII alphanumeric first character, then up to 95 alphanumeric/underscore/dot/colon/hyphen characters. Syntax is not proof of safe provenance. UTC timestamps use YYYY-MM-DDTHH:mm:ss[.SSS]Z with 1–3 optional fractional digits. Only one submission in flight; concurrent calls receive unavailable. Policy sampling uses the tenant/source minute admission counter. Expiry is lazy on submit/read; history is not durable unless diagnosticStore is configured; provider retention is independent. Shutdown and local uncertainty do not prove write reversal. Never use this subset for regulated retention, evidence custody or legal hold fulfilment.
 
 Compatibility: version 1 envelope and named receipt categories/codes are the current development contract; no released compatibility assurance. Breaking field, result or semantic changes require coordinated contract revision and affected consumer acceptance. Tests and package/Nuxt integration acceptance remain pending.
