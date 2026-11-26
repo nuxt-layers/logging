@@ -1,0 +1,3 @@
+# Storage register
+
+Process-local diagnostic history: up to configured capacity, trusted tenant/source, codes, opaque correlation, numeric/boolean fields and timestamps. Purpose: technical diagnostics. Retention configured by host, at most 30 days; lazy expiry and process termination. No durable storage, cookies or browser storage. Host local sink receives sanitised records and must independently document location, retention, access, deletion and backup controls. Rate buckets and global health counters are process-local. Legal holds and protected erasure are not implemented; do not deploy for workloads requiring them.

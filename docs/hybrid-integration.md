@@ -1,0 +1,5 @@
+# Hybrid integration
+
+Owner-approved layout: src is framework-independent; server and nuxt.config.ts are optional Nuxt contributions; app and i18n will be added with actual presentation. No empty placeholder directories. The core never imports Nuxt. The Nuxt server adapter uses an application-scoped registry, explicit composition, duplicate refusal and a close hook. No HTTP or browser surface is enabled. The optional peer dependency avoids imposing Nuxt on standalone consumers.
+
+The six approved screens require scoped public health, record detail, delivery, settings, protected export and rights commands before publication. Use Theme Manager public semantic tokens, Clock formatting, localisable messages, WCAG 2.2 AA, no-store/no-referrer/frame denial and server authorisation. Verify actual public dependencies before implementation. Minimal Nuxt host example is not executed; package resolution, Nitro integration, type checks, lockfile, CI, accessibility and security acceptance remain gates.
