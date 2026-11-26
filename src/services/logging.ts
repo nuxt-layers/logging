@@ -1,4 +1,4 @@
-import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision } from '../contracts/types.ts'
+import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision, LifecyclePublisher, LifecycleEvent } from '../contracts/types.ts'
 import { token, instant, bounded, levels, compileRules, effectiveRules, validateDiagnostic, diagnosticCode, plain, fields } from '../policy/validation.ts'
 import { deliver } from '../sinks/delivery.ts'
 
@@ -11,6 +11,8 @@ export function createLogging<E>(options: Options<E>) {
   // Snapshot provider references; callers must not mutate a composed trust boundary.
   options = {...options}
   const localSink = options.localSink
+  const journal = options.lifecycleJournal
+  let relayBusy=false
   if (!bounded(capacity,10000) || !bounded(rate,10000) || !bounded(timeout,30000) || !bounded(retention,86400000*30) || !token(revision) || !localSink || typeof localSink.write !== 'function') throw new Error('LOG_INVALID_CONFIG')
   const external = new Map<string,{sink:typeof localSink;maxAttempts:number}>()
   for (const target of options.externalSinks ?? []) {
@@ -117,13 +119,25 @@ export function createLogging<E>(options: Options<E>) {
   function matches(q:DiagnosticQuery,r:RecordEntry) {
     return r.tenantId===q.tenantId&&r.source===q.source&&Date.parse(r.receiptTime)>=Date.parse(q.from)&&Date.parse(r.receiptTime)<=Date.parse(q.to)&&(q.severity===undefined||r.severity===q.severity)&&(q.code===undefined||r.code===q.code)&&(q.correlation===undefined||r.correlation===q.correlation)&&(q.id===undefined||r.id===q.id)
   }
+  async function visibleEntries(q:DiagnosticQuery) {
+    const candidates=rows.filter(x=>!x.restricted&&matches(q,x.record))
+    if(!journal)return candidates
+    const result:typeof candidates=[]
+    for(const x of candidates) {
+      const {tenantId,source,id}=x.record
+      const state=await journal.visibility({tenantId,source,id})
+      if(state==='visible')result.push(x)
+      else if(state!=='restricted'&&state!=='erased')throw new Error('LOG_JOURNAL')
+    }
+    return result
+  }
   async function readDiagnostics(event:E,query:DiagnosticQuery) {
     const snapshot=snapshotQuery(query)
     if(!snapshot||!validQuery(snapshot)||!await authorised(event,'logging.read',snapshot.tenantId,snapshot.source)) return {status:'rejected' as const,records:[]}
     try {
       expire(time().ms)
       const offset=snapshot.offset??0
-      const records=rows.filter(x=>!x.restricted&&matches(snapshot,x.record)).slice(offset,offset+snapshot.limit).map(x=>x.record)
+      const records=(await visibleEntries(snapshot)).slice(offset,offset+snapshot.limit).map(x=>x.record)
       return {status:'completed' as const,records,coverage:'process-local; incomplete; pagination may shift' as const}
     } catch {return {status:'unavailable' as const,records:[]}}
   }
@@ -133,7 +147,7 @@ export function createLogging<E>(options: Options<E>) {
     try {
       expire(time().ms)
       const offset=snapshot.offset??0
-      return {status:'completed' as const,records:rows.filter(x=>!x.restricted&&matches(snapshot,x.record)).slice(offset,offset+snapshot.limit).map(x=>({id:x.record.id,delivery:x.delivery.map(d=>({...d}))})),coverage:'process-local; incomplete; in-flight destinations may be omitted' as const}
+      return {status:'completed' as const,records:(await visibleEntries(snapshot)).slice(offset,offset+snapshot.limit).map(x=>({id:x.record.id,delivery:x.delivery.map(d=>({...d}))})),coverage:'process-local; incomplete; in-flight destinations may be omitted' as const}
     } catch {return {status:'unavailable' as const,records:[]}}
   }
   async function readEffectivePolicy(event:E,scope:{tenantId:string;source:string}) {
@@ -178,7 +192,7 @@ export function createLogging<E>(options: Options<E>) {
       if(!current||current.subjectId!==caller.subjectId||closed||closing)return {status:'rejected',records:[]}
       expire(time().ms)
       const offset=q.offset??0
-      const records=rows.filter(x=>!x.restricted&&matches(q,x.record)).slice(offset,offset+q.limit).map(x=>x.record)
+      const records=(await visibleEntries(q)).slice(offset,offset+q.limit).map(x=>x.record)
       return {status:'completed-local',requestId,evidenceRef:approval.evidenceRef,records,coverage:'process-local only; incomplete; no provider export'}
     } catch {return {status:'unavailable',records:[]}}
     finally {lifecycleBusy=false}
@@ -198,13 +212,25 @@ export function createLogging<E>(options: Options<E>) {
       const current=await lifecycleCaller(event,action,q.tenantId,q.source)
       if(!current||current.subjectId!==caller.subjectId)return {status:'rejected'}
       if(closed||closing)return {status:'unavailable'}
+      if(journal) {
+        // State and event must commit atomically in the Logging-owned journal.
+        let outcome
+        try {
+          outcome=await journal.commit({action,target:q,requestId,subjectId:caller.subjectId!,evidenceRef:approval.evidenceRef,committedAt:time().instant})
+        } catch {outcome='uncertain'}
+        if(outcome==='conflict')return {status:'rejected'}
+        if(outcome!=='committed'&&outcome!=='duplicate') {
+          close()
+          return {status:'uncertain'}
+        }
+      }
       // A missing record and a previously removed record give the same local result.
       const index=rows.findIndex(x=>x.record.tenantId===q.tenantId&&x.record.source===q.source&&x.record.id===q.id)
       if(index>=0) {
         if(action==='erase')rows.splice(index,1)
         else {const row=rows[index];if(row)row.restricted=true}
       }
-      return {status:'completed-local',requestId,evidenceRef:approval.evidenceRef,providerState:'unknown'}
+      return {status:journal?'committed':'completed-local',requestId,evidenceRef:approval.evidenceRef,providerState:'unknown'}
     } catch {return {status:'unavailable'}}
     finally {lifecycleBusy=false}
   }
@@ -213,10 +239,34 @@ export function createLogging<E>(options: Options<E>) {
     if(!q||!validQuery(q)||!await authorised(event,'logging.health.read',q.tenantId,q.source))return {status:'rejected' as const}
     try {
       expire(time().ms)
-      const entries=rows.filter(x=>!x.restricted&&matches(q,x.record))
+      const entries=await visibleEntries(q)
       const delivery=entries.flatMap(x=>x.delivery)
       return {status:'completed' as const,records:entries.length,delivered:delivery.filter(x=>x.status==='delivered').length,exhausted:delivery.filter(x=>x.status==='exhausted').length,uncertain:delivery.filter(x=>x.status==='uncertain').length,coverage:'retained scoped records only; excludes intake losses, restricted and expired records; pagination ignored' as const}
     } catch {return {status:'unavailable' as const}}
+  }
+  // Composition-root-only relay. Acknowledgement is after publisher confirmation; duplicates are possible.
+  async function relayLifecycle(publish:LifecyclePublisher,limit=20) {
+    if(!journal||relayBusy||closing||closed||!bounded(limit,100))return {status:'unavailable' as const,published:0}
+    relayBusy=true
+    let published=0
+    try {
+      const events=await journal.pending(limit)
+      if(!Array.isArray(events)||events.length>limit)return {status:'unavailable' as const,published}
+      for(const event of events) {
+        if(closing||closed)return {status:'unavailable' as const,published}
+        const controller=new AbortController()
+        let timer:ReturnType<typeof setTimeout>|undefined
+        try {
+          const result=await Promise.race([Promise.resolve().then(()=>publish(event,controller.signal)),new Promise<Delivery>(resolve=>{timer=setTimeout(()=>{controller.abort();resolve('uncertain')},timeout)})])
+          if(result!=='delivered')return {status:result==='refused'?'unavailable' as const:'uncertain' as const,published}
+          await journal.acknowledge(event.id)
+          published++
+        } catch {return {status:'uncertain' as const,published}}
+        finally {if(timer!==undefined)clearTimeout(timer)}
+      }
+      return {status:'completed' as const,published}
+    } catch {return {status:'unavailable' as const,published}}
+    finally {relayBusy=false}
   }
   function close() {
     closing=true;closed=true;activeAbort?.abort();rows.length=0;buckets.clear()
@@ -231,5 +281,5 @@ export function createLogging<E>(options: Options<E>) {
       return await Promise.race([pending.then(()=>({status:'completed' as const})),new Promise<{status:'uncertain'}>(resolve=>{timer=setTimeout(()=>resolve({status:'uncertain'}),timeout)})])
     } finally {if(timer!==undefined)clearTimeout(timer)}
   }
-  return {submit,readDiagnostics,readDeliveryState,readEffectivePolicy,readPipelineHealth,exportDiagnostics,eraseDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'erase',target,requestId),restrictDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'restrict',target,requestId),hostHealth:()=>({state:closed||quarantined.size?'degraded' as const:(busy||lifecycleBusy)?'busy' as const:'unknown' as const,lastDelivery,drops,uncertain,buffered:rows.length,quarantined:[...quarantined]}),close,shutdown}
+  return {relayLifecycle,submit,readDiagnostics,readDeliveryState,readEffectivePolicy,readPipelineHealth,exportDiagnostics,eraseDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'erase',target,requestId),restrictDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'restrict',target,requestId),hostHealth:()=>({state:closed||quarantined.size?'degraded' as const:(busy||lifecycleBusy)?'busy' as const:'unknown' as const,lastDelivery,drops,uncertain,buffered:rows.length,quarantined:[...quarantined]}),close,shutdown}
 }

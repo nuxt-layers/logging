@@ -13,7 +13,11 @@
       "default": "./src/index.ts"
     },
     "./nuxt": "./nuxt.config.ts",
-    "./nuxt/server": "./server/utils/logging.ts"
+    "./nuxt/server": "./server/utils/logging.ts",
+    "./sqlite": {
+      "types": "./src/adapters/sqlite-lifecycle.d.mts",
+      "default": "./src/adapters/sqlite-lifecycle.mjs"
+    }
   },
   "scripts": {
     "test": "node --test tests/unit/*.test.ts tests/integration/*.test.ts",

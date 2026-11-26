@@ -58,6 +58,7 @@ The named artefacts identify conceptual owners, not mandatory package imports or
 | Effective policy query | Authorised administrators | readEffectivePolicy | Implemented |
 | Shutdown | Composition root | close / shutdown | Implemented |
 | Local export, restriction and erasure requests | Authorised operators, Privacy, Legal Compliance | exportDiagnostics / restrictDiagnostic / eraseDiagnostic | Implemented, local projection only |
+| Durable lifecycle state and outbox | Host-composed Logging-owned journal | lifecycleJournal | Optional implemented port; SQLite adapter provided |
 | Independent lifecycle approval and preservation decision | Host-composed qualified authorities | approveLifecycle | Optional implemented port; missing blocks commands |
 | Scoped pipeline health query | Authorised operators / Observability | readPipelineHealth | Implemented, retained records only |
 | Privileged policy change, provider rights/hold/recovery commands | Authorised operators, Privacy, Legal Compliance | No callable API | Approved; unavailable |
@@ -90,11 +91,26 @@ export type LifecycleDecision =
   | { status:'approved'; evidenceRef:string; preservation:'clear'|'held'|'unknown' }
   | { status:'blocked'|'unknown' }
 export type LifecycleResult =
-  | { status:'completed-local'; requestId:string; evidenceRef:string; providerState:'unknown' }
+  | { status:'completed-local'|'committed'; requestId:string; evidenceRef:string; providerState:'unknown' }
   | { status:'blocked'|'rejected'|'unavailable'|'uncertain' }
 export type ExportResult =
   | { status:'completed-local'; requestId:string; evidenceRef:string; records:RecordEntry[]; coverage:string }
   | { status:'blocked'|'rejected'|'unavailable'|'uncertain'; records:never[] }
+export type LifecycleEvent = Readonly<{
+  version:1; id:string; type:'logging.restricted'|'logging.erased'; tenantId:string; source:string;
+  recordId:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string
+}>
+export type LifecycleCommit = {
+  action:'restrict'|'erase'; target:LifecycleTarget; requestId:string; subjectId:string;
+  evidenceRef:string; committedAt:string
+}
+export type LifecycleJournal = {
+  commit(command:LifecycleCommit):Promise<'committed'|'duplicate'|'conflict'|'uncertain'>
+  visibility(target:LifecycleTarget):Promise<'visible'|'restricted'|'erased'>
+  pending(limit:number):Promise<LifecycleEvent[]>
+  acknowledge(eventId:string):Promise<void>
+}
+export type LifecyclePublisher = (event:LifecycleEvent,signal:AbortSignal)=>Promise<Delivery>
 export type Options<E> = {
   resolveCaller(event: E): Promise<Caller | null>
   resolveProducer(event: E): Promise<Producer | null>
@@ -108,6 +124,7 @@ export type Options<E> = {
   ratePerMinute?: number
   timeoutMs?: number
   externalSinks?: readonly ExternalSink[]
+  lifecycleJournal?: LifecycleJournal
   approveLifecycle?: (request:LifecycleApproval) => Promise<LifecycleDecision>
   resolvePolicy?: (scope:{tenantId:string;source:string}) => Promise<Policy | null>
 }
@@ -158,6 +175,7 @@ interface LoggingSurface<E> {
   exportDiagnostics(event:E,query:DiagnosticQuery,requestId:string):Promise<ExportResult>
   eraseDiagnostic(event:E,target:LifecycleTarget,requestId:string):Promise<LifecycleResult>
   restrictDiagnostic(event:E,target:LifecycleTarget,requestId:string):Promise<LifecycleResult>
+  relayLifecycle(publish:LifecyclePublisher,limit?:number):Promise<{status:'completed'|'unavailable'|'uncertain';published:number}>
   hostHealth(): HostHealth
   close(): void
   shutdown(): Promise<{status:'completed'|'uncertain'}>
@@ -178,7 +196,7 @@ interface LoggingSurface<E> {
 | Scoped retained-record health | Authorised operators / Observability | readPipelineHealth | Implemented, incomplete |
 | Local export, restriction and erasure outcomes | Authorised operators / Privacy / Legal Compliance | exportDiagnostics / restrictDiagnostic / eraseDiagnostic | Implemented, not provider custody |
 | Provider retention/hold/rights/recovery outcomes | Authorised operators / Privacy / Legal Compliance | No callable API | Approved; unavailable |
-| Committed lifecycle events | Audit / Observability | No event or relay API | Approved; unavailable |
+| Committed restriction/erasure lifecycle events | Host relay / Message Queue / Audit / Observability | relayLifecycle / LifecycleEvent | Implemented with journal; delivery integration unverified |
 
 ### Diagnostic intake
 
@@ -225,9 +243,17 @@ approveLifecycle is an optional host-supplied port. It receives the action, auth
 
 exportDiagnostics accepts the same bounded query as readDiagnostics, plus requestId. Returns completed-local with records and evidence reference, or rejected/blocked/unavailable/uncertain and empty records. It excludes restricted records. This is a bounded in-memory projection, not a portable export from every sink. Recheck permission and the same authenticated subject after approval before disclosure.
 
-eraseDiagnostic and restrictDiagnostic accept exact tenantId/source/id plus requestId. Erasure requires explicit clear preservation; held blocks and unknown fails closed. Restriction hides the retained record from reads, exports, delivery projections and scoped health. Recheck permission and the same authenticated subject after approval. completed-local means the local projection was removed or hidden, or was already absent; no existence oracle or provider deletion confirmation. providerState is always unknown. No durable restriction or legal-hold enforcement across sinks, restarts or cache expiry; do not use this for regulated rights fulfilment. Request IDs support correlation only, not durable idempotency; repeat requests require independent approval again. Privileged operations serialize with intake; busy returns unavailable. Shutdown does not wait for approval ports; no local change follows a closed instance.
+eraseDiagnostic and restrictDiagnostic accept exact tenantId/source/id plus requestId. Erasure requires explicit clear preservation; held blocks and unknown fails closed. Restriction hides the retained record from reads, exports, delivery projections and scoped health. Recheck permission and the same authenticated subject after approval. completed-local means the local projection was removed or hidden, or was already absent; no existence oracle or provider deletion confirmation. providerState is always unknown. Without a journal there is no durable restriction across restarts. No legal-hold enforcement across sinks or cache expiry; do not use this for regulated rights fulfilment. Without a journal request IDs support correlation only. Repeat requests always require independent approval again. Privileged operations serialize with intake; busy returns unavailable. Shutdown does not wait for approval ports; no local change follows a closed instance.
 
 readPipelineHealth uses the same validated tenant/source/time/filter query and separate permission. Returns completed with retained record count and delivered/exhausted/uncertain destination counts, or rejected/unavailable. Pagination is ignored for aggregates; limit is still required. Counts exclude restricted, expired, refused-before-retention and unobserved records; no global loss or coverage claim.
+
+### Optional durable lifecycle journal and relay
+
+Import createSqliteLifecycleJournal(path) from '@nuxt-layers/logging/sqlite' and pass it as lifecycleJournal in Options. This optional Node adapter uses node:sqlite, a persistent host-selected file, WAL and FULL synchronous commits. The host owns file permissions, storage location, backup, retention and close. Do not share the file with unrelated capabilities. No database is required for ordinary diagnostic intake.
+
+The journal atomically commits restriction/erasure state, request identity and a version-1 lifecycle event. Duplicate tenant/source/request with identical action, target, subject and evidence reference is idempotent; changed content is conflict (rejected). Erasure is terminal for that record ID. A committed result means the Logging-owned lifecycle state and event committed, not external sink deletion; providerState remains unknown. Uncertain commit closes intake and clears local history; recompose and reconcile via the durable journal. All diagnostic projections check journal visibility; lookup errors fail closed. Diagnostic records themselves remain process-local, not recovered from this journal. Existing holds still require independent preservation approval; journal is not the legal authority.
+
+LifecycleEvent contains stable ID, version, event type, tenant/source, opaque record/request/subject/evidence references and commit UTC. No diagnostic payload. Events describe committed Logging state only, not Audit custody or provider erasure. Host must classify references and restrict event recipients. relayLifecycle(publish, limit=20) is a composition-root-only pull/ack operation, max 100, one relay in flight per instance. Publisher returns delivered only after durable downstream acknowledgement. Refusal or uncertainty leaves the event pending; acknowledgement failure may duplicate delivery. Consumers deduplicate on event ID. Host schedules relay and must use a single active relay per journal; no distributed lease or automatic retries. Acknowledged events and request/tombstone state are retained until a governed retention mechanism is implemented; bounded relay batches do not bound database growth. No Message Queue integration is presumed. Host bounds journal operations and closes the adapter after all work settles.
 
 ## Permissions
 
@@ -242,7 +268,7 @@ readPipelineHealth uses the same validated tenant/source/time/filter query and s
 | logging.erase | Requested tenantId/source | Remove local projection; clear preservation required |
 | logging.restrict | Requested tenantId/source | Hide local projection |
 
-All require affirmative server-side resource decisions; queries require matching trusted tenant before lookup. Separate permissions are not interchangeable. hostHealth, close and shutdown are composition-root-only, not user-facing permissions. No cross-tenant override or privilege bypass. Local protected commands additionally require independently attributable approval. Provider-level rights and privileged policy mutation remain unavailable.
+All require affirmative server-side resource decisions; queries require matching trusted tenant before lookup. Separate permissions are not interchangeable. hostHealth, close and shutdown are composition-root-only, not user-facing permissions. No cross-tenant override or privilege bypass. Local protected commands additionally require independently attributable approval. Provider-level rights and privileged policy mutation remain unavailable. relayLifecycle is composition-root-only.
 
 ## Screens
 
@@ -258,7 +284,7 @@ In one host Nitro plugin, import provideLogging, getLogging and closeLogging fro
 
 Implemented: validated diagnostic admission, sanitised sink output, scoped reads, delivery projection, effective policy projection, scoped retained-record health, protected local export/restriction/erasure, host health and shutdown. These work without a GUI, Nuxt or external destinations. No mandatory database.
 
-Approved but unavailable: governed privileged policy mutations, durable/provider export, retention/hold/restriction/erasure commands and results, complete scoped loss/backlog health, committed lifecycle events and durable outbox/relay, persistent recovery and manual retry. Do not call invented methods or substitute Logging receipts for Audit evidence. Missing provider contracts must be reconciled before claiming those integrations.
+Approved but unavailable: governed privileged policy mutations, durable/provider export, retention/hold/restriction/erasure commands and results, complete scoped loss/backlog health, committed lifecycle events for other operations, durable diagnostic record recovery and manual retry. Do not call invented methods or substitute Logging receipts for Audit evidence. Missing provider contracts must be reconciled before claiming those integrations.
 
 ## You will hit this
 

@@ -23,11 +23,26 @@ export type LifecycleDecision =
   | { status:'approved'; evidenceRef:string; preservation:'clear'|'held'|'unknown' }
   | { status:'blocked'|'unknown' }
 export type LifecycleResult =
-  | { status:'completed-local'; requestId:string; evidenceRef:string; providerState:'unknown' }
+  | { status:'completed-local'|'committed'; requestId:string; evidenceRef:string; providerState:'unknown' }
   | { status:'blocked'|'rejected'|'unavailable'|'uncertain' }
 export type ExportResult =
   | { status:'completed-local'; requestId:string; evidenceRef:string; records:RecordEntry[]; coverage:string }
   | { status:'blocked'|'rejected'|'unavailable'|'uncertain'; records:never[] }
+export type LifecycleEvent = Readonly<{
+  version:1; id:string; type:'logging.restricted'|'logging.erased'; tenantId:string; source:string;
+  recordId:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string
+}>
+export type LifecycleCommit = {
+  action:'restrict'|'erase'; target:LifecycleTarget; requestId:string; subjectId:string;
+  evidenceRef:string; committedAt:string
+}
+export type LifecycleJournal = {
+  commit(command:LifecycleCommit):Promise<'committed'|'duplicate'|'conflict'|'uncertain'>
+  visibility(target:LifecycleTarget):Promise<'visible'|'restricted'|'erased'>
+  pending(limit:number):Promise<LifecycleEvent[]>
+  acknowledge(eventId:string):Promise<void>
+}
+export type LifecyclePublisher = (event:LifecycleEvent,signal:AbortSignal)=>Promise<Delivery>
 export type Options<E> = {
   resolveCaller(event: E): Promise<Caller | null>
   resolveProducer(event: E): Promise<Producer | null>
@@ -41,6 +56,7 @@ export type Options<E> = {
   ratePerMinute?: number
   timeoutMs?: number
   externalSinks?: readonly ExternalSink[]
+  lifecycleJournal?: LifecycleJournal
   approveLifecycle?: (request:LifecycleApproval) => Promise<LifecycleDecision>
   resolvePolicy?: (scope:{tenantId:string;source:string}) => Promise<Policy | null>
 }
