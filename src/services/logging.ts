@@ -1,4 +1,4 @@
-import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult } from '../contracts/types.ts'
+import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision } from '../contracts/types.ts'
 import { token, instant, bounded, levels, compileRules, effectiveRules, validateDiagnostic, diagnosticCode, plain, fields } from '../policy/validation.ts'
 import { deliver } from '../sinks/delivery.ts'
 
@@ -154,7 +154,7 @@ export function createLogging<E>(options: Options<E>) {
     } catch {return null}
   }
   // The approval port is an independent, attributable precondition, not a Logging receipt.
-  async function approve(action:LifecycleAction,caller:Caller,requestId:string,target:LifecycleTarget|DiagnosticQuery) {
+  async function approve(action:LifecycleAction,caller:Caller,requestId:string,target:LifecycleTarget|DiagnosticQuery):Promise<LifecycleDecision> {
     if(!options.approveLifecycle)return {status:'unknown' as const}
     try {
       const result=await options.approveLifecycle({action,caller,requestId,target:Object.freeze({...target})})
@@ -174,7 +174,8 @@ export function createLogging<E>(options: Options<E>) {
       if(approval.status!=='approved')return {status:approval.status==='blocked'?'blocked':'unavailable',records:[]}
       if(closed||closing)return {status:'unavailable',records:[]}
       // Recheck after the external approval; no data is disclosed on a revoked decision.
-      if(!await authorised(event,'logging.export',q.tenantId,q.source)||closed||closing)return {status:'rejected',records:[]}
+      const current=await lifecycleCaller(event,'export',q.tenantId,q.source)
+      if(!current||current.subjectId!==caller.subjectId||closed||closing)return {status:'rejected',records:[]}
       expire(time().ms)
       const offset=q.offset??0
       const records=rows.filter(x=>!x.restricted&&matches(q,x.record)).slice(offset,offset+q.limit).map(x=>x.record)
@@ -193,7 +194,10 @@ export function createLogging<E>(options: Options<E>) {
       const approval=await approve(action,caller,requestId,q)
       if(approval.status!=='approved')return {status:approval.status==='blocked'?'blocked':'unavailable'}
       if(action==='erase'&&approval.preservation!=='clear')return {status:approval.preservation==='held'?'blocked':'unavailable'}
-      if(closed||closing||!await authorised(event,'logging.'+action,q.tenantId,q.source)||closed||closing)return {status:'unavailable'}
+      if(closed||closing)return {status:'unavailable'}
+      const current=await lifecycleCaller(event,action,q.tenantId,q.source)
+      if(!current||current.subjectId!==caller.subjectId)return {status:'rejected'}
+      if(closed||closing)return {status:'unavailable'}
       // A missing record and a previously removed record give the same local result.
       const index=rows.findIndex(x=>x.record.tenantId===q.tenantId&&x.record.source===q.source&&x.record.id===q.id)
       if(index>=0) {

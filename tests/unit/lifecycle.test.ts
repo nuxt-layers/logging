@@ -56,3 +56,10 @@ test('scoped health requires separate permission and never exposes another tenan
  if(result.status==='completed')assert.equal(result.records,0)
  assert.equal((await service.readPipelineHealth({...event,tenantId:'b'},q)).status,'rejected')
 })
+
+test('approval cannot be transferred to a changed caller',async()=>{
+ let subject='operator'
+ const service=setup({resolveCaller:async e=>({...e,subjectId:subject}),approveLifecycle:async()=>{subject='other';return clear()}})
+ await service.submit(event,diagnostic)
+ assert.equal((await service.exportDiagnostics(event,q,'req')).status,'rejected')
+})
