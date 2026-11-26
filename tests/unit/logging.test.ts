@@ -43,3 +43,47 @@ test('expiry removes history',async()=>{
  now='2026-11-26T00:00:02Z'
  assert.equal((await service.readDiagnostics(event,{tenantId:'a',source:'worker',from:stamp,to:now,limit:10})).records.length,0)
 })
+
+test('strict envelope refuses unexpected fields',async()=>{
+ const service=setup()
+ assert.equal((await service.submit(event,{...diagnostic,raw:'never log'} as Diagnostic)).status,'rejected')
+})
+test('policy may narrow but never widen deployment rules',async()=>{
+ const narrower=setup({resolvePolicy:async()=>({revision:'v2',rules:[{source:'worker',code:'worker.done',purpose:'diagnostics',attributes:[],minimumSeverity:'warn'}]})})
+ assert.equal((await narrower.submit(event,diagnostic)).status,'rejected')
+ const wider=setup({resolvePolicy:async()=>({revision:'v2',rules:[{source:'worker',code:'worker.done',purpose:'diagnostics',attributes:['extra']}]})})
+ assert.equal((await wider.submit(event,diagnostic)).status,'unavailable')
+})
+test('external refusal retries; uncertainty quarantines; local intake stays accepted',async()=>{
+ let calls=0
+ const service=setup({rules:[{source:'worker',code:'worker.done',purpose:'diagnostics',attributes:['latency'],destinations:['remote']}],externalSinks:[{id:'remote',maxAttempts:3,sink:{write:async()=>{calls++;return calls===1?'refused':'uncertain'}}}]})
+ assert.equal((await service.submit(event,diagnostic)).status,'accepted')
+ assert.equal((await service.submit(event,diagnostic)).status,'accepted')
+ assert.equal(calls,2)
+ const q={tenantId:'a',source:'worker',from:stamp,to:stamp,limit:10}
+ const result=await service.readDeliveryState(event,q)
+ assert.equal(result.records[0]?.delivery[1]?.status,'uncertain')
+ assert.equal(result.records[1]?.delivery[1]?.attempts,0)
+ assert.equal((await service.readDeliveryState({...event,tenantId:'b'},q)).status,'rejected')
+})
+test('policy and delivery reads require distinct permissions',async()=>{
+ const service=setup({decide:async(_c,action)=>({allowed:action==='logging.submit'||action==='logging.read',reason:'test'})})
+ await service.submit(event,diagnostic)
+ const q={tenantId:'a',source:'worker',from:stamp,to:stamp,limit:10}
+ assert.equal((await service.readDiagnostics(event,q)).status,'completed')
+ assert.equal((await service.readDeliveryState(event,q)).status,'rejected')
+ assert.equal((await service.readEffectivePolicy(event,q)).status,'rejected')
+})
+test('query filters and shutdown',async()=>{
+ const service=setup()
+ const r=await service.submit(event,diagnostic)
+ const q={tenantId:'a',source:'worker',from:stamp,to:stamp,limit:10}
+ assert.equal((await service.readDiagnostics(event,{...q,id:r.id})).records.length,1)
+ assert.equal((await service.readDiagnostics(event,{...q,severity:'fatal'})).records.length,0)
+ assert.equal((await service.shutdown()).status,'completed')
+ assert.equal((await service.submit(event,diagnostic)).status,'unavailable')
+})
+test('missing policy fails closed and invalid calendar dates reject',async()=>{
+ assert.equal((await setup({resolvePolicy:async()=>null}).submit(event,diagnostic)).status,'unavailable')
+ assert.equal((await setup().submit(event,{...diagnostic,occurrenceTime:'2026-02-30T00:00:00Z'})).status,'rejected')
+})

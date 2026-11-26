@@ -2,11 +2,15 @@ export type Severity = 'debug' | 'info' | 'warn' | 'error' | 'fatal'
 export type Caller = { tenantId: string; subjectId: string | null; assurance: unknown }
 export type Producer = Caller & { source: string }
 export type Diagnostic = { version: 1; code: string; severity: Severity; occurrenceTime: string; correlation?: string; attributes?: Record<string, number | boolean> }
-export type RecordEntry = Readonly<{ id: string; tenantId: string; source: string; code: string; severity: Severity; occurrenceTime: string; receiptTime: string; timeQuality: 'verified' | 'degraded' | 'unknown'; correlation?: string; attributes: Readonly<Record<string, number | boolean>>; policyRevision: string }>
+export type RecordEntry = Readonly<{ id: string; tenantId: string; source: string; code: string; severity: Severity; occurrenceTime: string; receiptTime: string; timeQuality: 'verified' | 'degraded' | 'unknown'; correlation?: string; attributes: Readonly<Record<string, number | boolean>>; policyRevision: string; purpose: string; category: string; classification: 'technical' }>
 export type Delivery = 'delivered' | 'refused' | 'uncertain'
 export type Receipt = { status: 'accepted' | 'rejected' | 'throttled' | 'unavailable' | 'uncertain'; code: string; id?: string }
 export type Sink = { write(record: RecordEntry, signal: AbortSignal): Promise<Delivery> }
-export type Rule = { source: string; code: string; attributes: readonly string[]; purpose: string }
+export type Rule = { source: string; code: string; attributes: readonly string[]; purpose: string; category?: string; minimumSeverity?: Severity; sampleEvery?: number; destinations?: readonly string[] }
+export type DiagnosticQuery = { tenantId:string; source:string; from:string; to:string; limit:number; offset?:number; severity?:Severity; code?:string; correlation?:string; id?:string }
+export type Policy = { revision:string; rules:readonly Rule[] }
+export type ExternalSink = { id:string; sink:Sink; maxAttempts?:number }
+export type DeliveryState = { target:string; status:'delivered'|'exhausted'|'uncertain'; attempts:number; time:string }
 export type Options<E> = {
   resolveCaller(event: E): Promise<Caller | null>
   resolveProducer(event: E): Promise<Producer | null>
@@ -19,4 +23,6 @@ export type Options<E> = {
   retentionMs: number
   ratePerMinute?: number
   timeoutMs?: number
+  externalSinks?: readonly ExternalSink[]
+  resolvePolicy?: (scope:{tenantId:string;source:string}) => Promise<Policy | null>
 }
