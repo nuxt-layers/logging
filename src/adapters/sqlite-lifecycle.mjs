@@ -48,6 +48,10 @@ export function createSqliteLifecycleJournal(path) {
           db.exec('ROLLBACK')
           return previous.fingerprint===fingerprint?'duplicate':'conflict'
         }
+        if(action==='restrict'&&state.get(tenantId,source,id)?.state==='erased') {
+          db.exec('ROLLBACK')
+          return 'conflict'
+        }
         const event={version:1,id:randomUUID(),type:action==='erase'?'logging.erased':'logging.restricted',tenantId,source,recordId:id,requestId,subjectId,evidenceRef,committedAt}
         mutate.run(tenantId,source,id,action==='erase'?'erased':'restricted')
         insertRequest.run(tenantId,source,requestId,fingerprint)

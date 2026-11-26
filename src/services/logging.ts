@@ -1,4 +1,4 @@
-import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision, LifecyclePublisher, LifecycleEvent } from '../contracts/types.ts'
+import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision, LifecyclePublisher } from '../contracts/types.ts'
 import { token, instant, bounded, levels, compileRules, effectiveRules, validateDiagnostic, diagnosticCode, plain, fields } from '../policy/validation.ts'
 import { deliver } from '../sinks/delivery.ts'
 
@@ -129,7 +129,8 @@ export function createLogging<E>(options: Options<E>) {
       if(state==='visible')result.push(x)
       else if(state!=='restricted'&&state!=='erased')throw new Error('LOG_JOURNAL')
     }
-    return result
+    if(closing||closed)throw new Error('LOG_JOURNAL')
+    return result.filter(x=>!x.restricted&&rows.includes(x))
   }
   async function readDiagnostics(event:E,query:DiagnosticQuery) {
     const snapshot=snapshotQuery(query)

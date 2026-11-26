@@ -24,7 +24,7 @@ test('journal persists state and event atomically across reopen and deduplicates
   await journal.acknowledge(event.id)
   assert.equal((await journal.pending(10)).length,0)
   assert.equal(await journal.commit({...command,action:'erase',requestId:'req2'}),'committed')
-  assert.equal(await journal.commit({...command,requestId:'req3'}),'committed')
+  assert.equal(await journal.commit({...command,requestId:'req3'}),'conflict')
   assert.equal(await journal.visibility(command.target),'erased')
  } finally {journal.close();rmSync(dir,{recursive:true,force:true})}
 })
