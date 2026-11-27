@@ -11,3 +11,5 @@ Persistent diagnostic store implemented in same journal database, before-sink pe
 Architecture master rechecked at e9dac240c16891fcbed9669228dac6cd5cde9c3c. Purpose-specific retention and rotating maintenance scans implemented. Journal evidence compaction requires explicit governed retention and is not performed by this batch.
 
 Governed acknowledged-event payload pruning implemented with verified acknowledgement time, bounded rotating scan, explicit preservation clearance and conditional deletion. Request identity and marker retirement remain intentionally unsupported.
+
+Qualified provider operation and Configuration compare-and-set policy ports added. Actual provider implementations, atomic external hold/recovery checks and event coverage remain unverified.

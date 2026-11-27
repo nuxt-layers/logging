@@ -11,13 +11,14 @@ export type DiagnosticQuery = { tenantId:string; source:string; from:string; to:
 export type Policy = { revision:string; rules:readonly Rule[] }
 export type ExternalSink = { id:string; sink:Sink; maxAttempts?:number }
 export type DeliveryState = { target:string; status:'delivered'|'exhausted'|'uncertain'; attempts:number; time:string }
-export type LifecycleAction = 'export' | 'erase' | 'restrict'
+export type LifecycleAction = 'export' | 'erase' | 'restrict' | 'recover' | 'policy.change'
 export type LifecycleTarget = { tenantId:string; source:string; id:string }
 export type LifecycleApproval = {
   action:LifecycleAction
   caller:Caller
   requestId:string
-  target:LifecycleTarget | DiagnosticQuery
+  destination?:string
+  target:LifecycleTarget | DiagnosticQuery | PolicyChange
 }
 export type LifecycleDecision =
   | { status:'approved'; evidenceRef:string; preservation:'clear'|'held'|'unknown' }
@@ -65,6 +66,15 @@ export type LifecycleJournal = {
   maintenance?: JournalMaintenance
 }
 export type LifecyclePublisher = (event:LifecycleEvent,signal:AbortSignal)=>Promise<Delivery>
+export type ProviderLifecycleRequest = {
+  action:'erase'|'restrict'|'recover'; target:LifecycleTarget; destination:string; requestId:string;
+  subjectId:string; evidenceRef:string
+}
+export type ProviderLifecycleResult =
+  | {status:'confirmed'; evidenceRef:string}
+  | {status:'blocked'|'rejected'|'unavailable'|'uncertain'}
+export type PolicyChange = {tenantId:string;source:string;expectedRevision:string;policy:Policy;requestId:string}
+export type PolicyChangeResult = {status:'committed';revision:string;evidenceRef:string} | {status:'rejected'|'blocked'|'conflict'|'unavailable'|'uncertain'}
 export type Options<E> = {
   resolveCaller(event: E): Promise<Caller | null>
   resolveProducer(event: E): Promise<Producer | null>
@@ -83,6 +93,8 @@ export type Options<E> = {
   diagnosticStore?: DiagnosticStore
   retentionAuthority?: OptionsRetention
   journalRetention?: JournalRetentionAuthority
+  providerLifecycle?: (request:ProviderLifecycleRequest,signal:AbortSignal)=>Promise<ProviderLifecycleResult>
+  commitPolicy?: (change:PolicyChange,caller:Caller,approvalEvidenceRef:string)=>Promise<PolicyChangeResult>
   approveLifecycle?: (request:LifecycleApproval) => Promise<LifecycleDecision>
   resolvePolicy?: (scope:{tenantId:string;source:string}) => Promise<Policy | null>
 }

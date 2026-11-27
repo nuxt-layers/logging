@@ -1,4 +1,4 @@
-import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision, LifecyclePublisher } from '../contracts/types.ts'
+import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision, LifecyclePublisher, ProviderLifecycleRequest, ProviderLifecycleResult, PolicyChange, PolicyChangeResult } from '../contracts/types.ts'
 import { token, instant, bounded, levels, compileRules, effectiveRules, validateDiagnostic, diagnosticCode, plain, fields } from '../policy/validation.ts'
 import { deliver } from '../sinks/delivery.ts'
 
@@ -199,10 +199,10 @@ export function createLogging<E>(options: Options<E>) {
     } catch {return null}
   }
   // The approval port is an independent, attributable precondition, not a Logging receipt.
-  async function approve(action:LifecycleAction,caller:Caller,requestId:string,target:LifecycleTarget|DiagnosticQuery):Promise<LifecycleDecision> {
+  async function approve(action:LifecycleAction,caller:Caller,requestId:string,target:LifecycleTarget|DiagnosticQuery|PolicyChange,destination?:string):Promise<LifecycleDecision> {
     if(!options.approveLifecycle)return {status:'unknown' as const}
     try {
-      const result=await options.approveLifecycle({action,caller,requestId,target:Object.freeze({...target})})
+      const result=await options.approveLifecycle({action,caller,requestId,destination,target:Object.freeze(structuredClone(target))})
       if(result?.status==='approved'&&token(result.evidenceRef)&&['clear','held','unknown'].includes(result.preservation))return result
       return {status:result?.status==='blocked'?'blocked' as const:'unknown' as const}
     } catch {return {status:'unknown' as const}}
@@ -263,6 +263,63 @@ export function createLogging<E>(options: Options<E>) {
       }
       return {status:journal?'committed':'completed-local',requestId,evidenceRef:approval.evidenceRef,providerState:'unknown'}
     } catch {return {status:'unavailable'}}
+    finally {lifecycleBusy=false}
+  }
+  async function runProviderLifecycle(event:E,request:Pick<ProviderLifecycleRequest,'action'|'target'|'destination'|'requestId'>):Promise<ProviderLifecycleResult> {
+    if(!plain(request)||!fields(request,['action','target','destination','requestId']))return {status:'rejected'}
+    const {action,destination,requestId,target}=request
+    if(!['erase','restrict','recover'].includes(action)||!token(destination)||!token(requestId)||!plain(target)||!fields(target,['tenantId','source','id'])||!token(target.tenantId)||!token(target.source)||!token(target.id))return {status:'rejected'}
+    const q={tenantId:target.tenantId,source:target.source,id:target.id}
+    if(!options.providerLifecycle||busy||lifecycleBusy||closing||closed)return {status:'unavailable'}
+    lifecycleBusy=true
+    try {
+      const caller=await lifecycleCaller(event,action,q.tenantId,q.source)
+      if(!caller||(await options.decide(caller,'logging.provider.'+action,q)).allowed!==true)return {status:'rejected'}
+      if(destination!=='local'&&!external.has(destination))return {status:'rejected'}
+      const approval=await approve(action,caller,requestId,q,destination)
+      if(approval.status!=='approved')return {status:approval.status==='blocked'?'blocked':'unavailable'}
+      if((action==='erase'||action==='recover')&&approval.preservation!=='clear')return {status:approval.preservation==='held'?'blocked':'unavailable'}
+      const current=await lifecycleCaller(event,action,q.tenantId,q.source)
+      if(!current||current.subjectId!==caller.subjectId||(await options.decide(current,'logging.provider.'+action,q)).allowed!==true)return {status:'rejected'}
+      if(closed||closing)return {status:'unavailable'}
+      if(!journal)return {status:'unavailable'}
+      if(action==='recover'&&await journal.visibility(q)!=='visible')return {status:'blocked'}
+      if(closed||closing)return {status:'unavailable'}
+      const controller=new AbortController()
+      let timer:ReturnType<typeof setTimeout>|undefined
+      try {
+        const result=await Promise.race([options.providerLifecycle({action,target:q,destination,requestId,subjectId:caller.subjectId!,evidenceRef:approval.evidenceRef},controller.signal),new Promise<ProviderLifecycleResult>(resolve=>{timer=setTimeout(()=>{controller.abort();resolve({status:'uncertain'})},timeout)})])
+        if(result?.status==='confirmed'&&token(result.evidenceRef))return {status:'confirmed',evidenceRef:result.evidenceRef}
+        if(result&&['blocked','rejected','unavailable','uncertain'].includes(result.status))return result
+        return {status:'uncertain'}
+      } catch {return {status:'uncertain'}}
+      finally {if(timer!==undefined)clearTimeout(timer)}
+    } catch {return {status:'unavailable'}}
+    finally {lifecycleBusy=false}
+  }
+  async function changePolicy(event:E,input:PolicyChange):Promise<PolicyChangeResult> {
+    if(!plain(input)||!fields(input,['tenantId','source','expectedRevision','policy','requestId'])||!token(input.tenantId)||!token(input.source)||!token(input.expectedRevision)||!token(input.requestId)||!plain(input.policy)||!fields(input.policy,['revision','rules'])||!token(input.policy.revision)||input.policy.revision===input.expectedRevision)return {status:'rejected'}
+    if(!options.commitPolicy||!options.resolvePolicy||busy||lifecycleBusy||closing||closed)return {status:'unavailable'}
+    const {tenantId,source,expectedRevision,requestId}=input
+    let change:PolicyChange
+    try {change={tenantId,source,expectedRevision,requestId,policy:{revision:input.policy.revision,rules:effectiveRules(floors,input.policy.rules,source,new Set(external.keys()))}}}catch{return {status:'rejected'}}
+    lifecycleBusy=true
+    try {
+      const caller=await lifecycleCaller(event,'policy.change',tenantId,source)
+      if(!caller)return {status:'rejected'}
+      const approval=await approve('policy.change',caller,requestId,change)
+      if(approval.status!=='approved')return {status:approval.status==='blocked'?'blocked':'unavailable'}
+      const current=await lifecycleCaller(event,'policy.change',tenantId,source)
+      if(!current||current.subjectId!==caller.subjectId)return {status:'rejected'}
+      if((await policy(tenantId,source))?.revision!==expectedRevision)return {status:'conflict'}
+      if(closed||closing)return {status:'unavailable'}
+      try {
+        const result=await options.commitPolicy(change,current,approval.evidenceRef)
+        if(result?.status==='committed'&&result.revision===change.policy.revision&&token(result.evidenceRef))return result
+        if(result&&['rejected','blocked','conflict','unavailable','uncertain'].includes(result.status))return result
+        return {status:'uncertain'}
+      }catch{return {status:'uncertain'}}
+    }catch{return {status:'unavailable'}}
     finally {lifecycleBusy=false}
   }
   async function readPipelineHealth(event:E,query:DiagnosticQuery) {
@@ -367,5 +424,5 @@ export function createLogging<E>(options: Options<E>) {
       return await Promise.race([pending.then(()=>({status:'completed' as const})),new Promise<{status:'uncertain'}>(resolve=>{timer=setTimeout(()=>resolve({status:'uncertain'}),timeout)})])
     } finally {if(timer!==undefined)clearTimeout(timer)}
   }
-  return {maintainJournal,maintainRetention,relayLifecycle,submit,readDiagnostics,readDeliveryState,readEffectivePolicy,readPipelineHealth,exportDiagnostics,eraseDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'erase',target,requestId),restrictDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'restrict',target,requestId),hostHealth:()=>({state:closed||quarantined.size?'degraded' as const:(busy||lifecycleBusy)?'busy' as const:'unknown' as const,lastDelivery,drops,uncertain,buffered:rows.length,quarantined:[...quarantined]}),close,shutdown}
+  return {runProviderLifecycle,changePolicy,maintainJournal,maintainRetention,relayLifecycle,submit,readDiagnostics,readDeliveryState,readEffectivePolicy,readPipelineHealth,exportDiagnostics,eraseDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'erase',target,requestId),restrictDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'restrict',target,requestId),hostHealth:()=>({state:closed||quarantined.size?'degraded' as const:(busy||lifecycleBusy)?'busy' as const:'unknown' as const,lastDelivery,drops,uncertain,buffered:rows.length,quarantined:[...quarantined]}),close,shutdown}
 }

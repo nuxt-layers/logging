@@ -81,13 +81,14 @@ export type DiagnosticQuery = { tenantId:string; source:string; from:string; to:
 export type Policy = { revision:string; rules:readonly Rule[] }
 export type ExternalSink = { id:string; sink:Sink; maxAttempts?:number }
 export type DeliveryState = { target:string; status:'delivered'|'exhausted'|'uncertain'; attempts:number; time:string }
-export type LifecycleAction = 'export' | 'erase' | 'restrict'
+export type LifecycleAction = 'export' | 'erase' | 'restrict' | 'recover' | 'policy.change'
 export type LifecycleTarget = { tenantId:string; source:string; id:string }
 export type LifecycleApproval = {
   action:LifecycleAction
   caller:Caller
   requestId:string
-  target:LifecycleTarget | DiagnosticQuery
+  destination?:string
+  target:LifecycleTarget | DiagnosticQuery | PolicyChange
 }
 export type LifecycleDecision =
   | { status:'approved'; evidenceRef:string; preservation:'clear'|'held'|'unknown' }
@@ -135,6 +136,15 @@ export type LifecycleJournal = {
   maintenance?: JournalMaintenance
 }
 export type LifecyclePublisher = (event:LifecycleEvent,signal:AbortSignal)=>Promise<Delivery>
+export type ProviderLifecycleRequest = {
+  action:'erase'|'restrict'|'recover'; target:LifecycleTarget; destination:string; requestId:string;
+  subjectId:string; evidenceRef:string
+}
+export type ProviderLifecycleResult =
+  | {status:'confirmed'; evidenceRef:string}
+  | {status:'blocked'|'rejected'|'unavailable'|'uncertain'}
+export type PolicyChange = {tenantId:string;source:string;expectedRevision:string;policy:Policy;requestId:string}
+export type PolicyChangeResult = {status:'committed';revision:string;evidenceRef:string} | {status:'rejected'|'blocked'|'conflict'|'unavailable'|'uncertain'}
 export type Options<E> = {
   resolveCaller(event: E): Promise<Caller | null>
   resolveProducer(event: E): Promise<Producer | null>
@@ -153,6 +163,8 @@ export type Options<E> = {
   diagnosticStore?: DiagnosticStore
   retentionAuthority?: OptionsRetention
   journalRetention?: JournalRetentionAuthority
+  providerLifecycle?: (request:ProviderLifecycleRequest,signal:AbortSignal)=>Promise<ProviderLifecycleResult>
+  commitPolicy?: (change:PolicyChange,caller:Caller,approvalEvidenceRef:string)=>Promise<PolicyChangeResult>
   approveLifecycle?: (request:LifecycleApproval) => Promise<LifecycleDecision>
   resolvePolicy?: (scope:{tenantId:string;source:string}) => Promise<Policy | null>
 }
@@ -203,6 +215,8 @@ interface LoggingSurface<E> {
   exportDiagnostics(event:E,query:DiagnosticQuery,requestId:string):Promise<ExportResult>
   eraseDiagnostic(event:E,target:LifecycleTarget,requestId:string):Promise<LifecycleResult>
   restrictDiagnostic(event:E,target:LifecycleTarget,requestId:string):Promise<LifecycleResult>
+  runProviderLifecycle(event:E,request:Pick<ProviderLifecycleRequest,'action'|'target'|'destination'|'requestId'>):Promise<ProviderLifecycleResult>
+  changePolicy(event:E,input:PolicyChange):Promise<PolicyChangeResult>
   maintainJournal(limit?:number):Promise<{status:'completed'|'unavailable'|'uncertain';removed:number;held:number}>
   maintainRetention(limit?:number):Promise<{status:'completed'|'unavailable'|'uncertain';removed:number;held:number}>
   relayLifecycle(publish:LifecyclePublisher,limit?:number):Promise<{status:'completed'|'unavailable'|'uncertain';published:number}>
@@ -226,6 +240,8 @@ interface LoggingSurface<E> {
 | Scoped retained-record health | Authorised operators / Observability | readPipelineHealth | Implemented, incomplete |
 | Local export, restriction and erasure outcomes | Authorised operators / Privacy / Legal Compliance | exportDiagnostics / restrictDiagnostic / eraseDiagnostic | Implemented, not provider custody |
 | Provider retention/hold/rights/recovery outcomes | Authorised operators / Privacy / Legal Compliance | No callable API | Approved; unavailable |
+| Qualified provider lifecycle outcomes | Authorised operators | runProviderLifecycle | Optional port, unverified provider |
+| Policy change outcome | Authorised operator / Configuration | changePolicy | Optional port, unverified provider |
 | Committed restriction/erasure lifecycle events | Host relay / Message Queue / Audit / Observability | relayLifecycle / LifecycleEvent | Implemented with journal; delivery integration unverified |
 
 ### Diagnostic intake
@@ -296,6 +312,12 @@ Ordinary projections exclude records at or beyond their applicable retention lim
 
 Optional journalRetention supplies an approved positive retentionMs (maximum 3650 days) and independent resolvePreservation(event) callback. Requires a journal implementing maintenance. maintainJournal(limit=20) is composition-root-only, maximum 100 events per scan, requires verified clock and explicit clear preservation per event. Only acknowledged event payloads with verified acknowledgement timestamps at or before the cutoff are eligible. Unknown acknowledgement times, pending events, held or unknown preservation are never deleted. The adapter rechecks acknowledgement and cutoff at deletion. Rotating scans advance past held entries and wrap; completed means a batch completed, not that the journal is empty. Request identities and restriction/erasure markers remain intact; their governed disposal remains outstanding. Host coordinates concurrent preservation changes and independent evidence retention. No physical-media deletion or backup removal claim. Legacy acknowledged events lacking timestamp are retained.
 
+### Provider lifecycle and policy changes
+
+Optional providerLifecycle is a qualified host-composed operation for one configured destination (local or named external), exact record and request identity. runProviderLifecycle requires both logging.<action> and logging.provider.<action>, independently attributable approval bound to the destination, and current same-subject permission. Erasure and recovery require clear preservation; recovery additionally requires journal visibility. The provider must atomically recheck preservation, idempotency, record visibility and authority, and return confirmed only with independently verifiable evidence for that destination. Timeout/exception/malformed response is uncertain, never automatically retried. A confirmed provider operation does not imply local erasure or other destinations' completion. No actual external provider is included. The host must serialize concurrent hold/recovery and use bounded, cancellable provider operations.
+
+changePolicy validates the proposed rules against immutable deployment ceilings and the expected revision. Requires logging.policy.change, independent approval bound to the proposal and current same-subject permission. Optional commitPolicy receives change, caller and approval evidence reference; Configuration/host owns the atomic compare-and-set, approved policy persistence, idempotency and independent evidence. Committed means the port confirmed the specified revision, not that all consumers have refreshed. No local shadow policy or fabricated Configuration integration. Missing ports fail closed. Committed export, provider and policy-change events are not yet produced by the Logging journal.
+
 ## Permissions
 
 | Action | Resource | Risk/effect |
@@ -308,8 +330,11 @@ Optional journalRetention supplies an approved positive retentionMs (maximum 365
 | logging.export | Requested tenantId/source | Protected local diagnostic disclosure |
 | logging.erase | Requested tenantId/source | Remove local projection; clear preservation required |
 | logging.restrict | Requested tenantId/source | Hide local projection |
+| logging.recover | Requested tenantId/source | Authorise qualified recovery |
+| logging.provider.erase / restrict / recover | Requested tenantId/source | Additional destination operation permission |
+| logging.policy.change | Requested tenantId/source | Governed policy change |
 
-All require affirmative server-side resource decisions; queries require matching trusted tenant before lookup. Separate permissions are not interchangeable. hostHealth, close and shutdown are composition-root-only, not user-facing permissions. No cross-tenant override or privilege bypass. Local protected commands additionally require independently attributable approval. Provider-level rights and privileged policy mutation remain unavailable. relayLifecycle, maintainRetention and maintainJournal are composition-root-only.
+All require affirmative server-side resource decisions; queries require matching trusted tenant before lookup. Separate permissions are not interchangeable. hostHealth, close and shutdown are composition-root-only, not user-facing permissions. No cross-tenant override or privilege bypass. Local protected commands additionally require independently attributable approval. Provider-level rights and privileged policy mutation require the optional qualified ports; absent ports fail closed. relayLifecycle, maintainRetention and maintainJournal are composition-root-only.
 
 ## Screens
 
@@ -325,7 +350,7 @@ In one host Nitro plugin, import provideLogging, getLogging and closeLogging fro
 
 Implemented: validated diagnostic admission, sanitised sink output, scoped reads, delivery projection, effective policy projection, scoped retained-record health, protected local export/restriction/erasure, host health and shutdown. These work without a GUI, Nuxt or external destinations. No mandatory database.
 
-Approved but unavailable: governed privileged policy mutations, provider-wide export, retention/hold/restriction/erasure commands and results, complete scoped loss/backlog health, committed lifecycle events for other operations, automatic replay/reconciliation of uncertain sink writes and manual retry. Do not call invented methods or substitute Logging receipts for Audit evidence. Missing provider contracts must be reconciled before claiming those integrations.
+Approved but unavailable: provider-wide export, provider hold management, complete scoped loss/backlog health, committed lifecycle events for other operations, automatic replay/reconciliation of uncertain sink writes and manual retry. Do not call invented methods or substitute Logging receipts for Audit evidence. Missing provider contracts must be reconciled before claiming those integrations.
 
 ## You will hit this
 
