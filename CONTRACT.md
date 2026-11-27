@@ -338,13 +338,17 @@ All require affirmative server-side resource decisions; queries require matching
 
 ## Screens
 
-No screens or HTTP endpoints currently shipped. Optional Nuxt layer:
+Optional Nuxt presentation and server API are implemented, pending host acceptance:
 
 ```ts
 export default defineNuxtConfig({ extends: ['@nuxt-layers/logging/nuxt'] })
 ```
 
-In one host Nitro plugin, import provideLogging, getLogging and closeLogging from '@nuxt-layers/logging/nuxt/server'. Given the Nitro application and trusted host Options<H3Event>, call provideLogging(app, options) once; it returns the same service surface specialised to H3Event. getLogging(app) returns service or undefined; duplicate registration throws LOG_ALREADY_COMPOSED. Register app.hooks.hook('close', () => closeLogging(app)); this closes and unregisters the service. Host supplies Nuxt and h3. No automatic registration, permission grant or browser intake. runtimeConfig.logging.presentation defaults false; no pages exist even if changed. Nuxt compatibility is targeted, not verified. Approved future routes: /logging, /logging/records, /logging/records/:id, /logging/delivery, /logging/settings, /logging/data-management. No presentation messages or routes are published yet.
+In one host Nitro plugin, import provideLogging, getLogging and closeLogging from '@nuxt-layers/logging/nuxt/server'. Given the Nitro application and trusted host Options<H3Event>, call provideLogging(app, options) once; it returns the same service surface specialised to H3Event. getLogging(app) returns service or undefined; duplicate registration throws LOG_ALREADY_COMPOSED. Register app.hooks.hook('close', () => closeLogging(app)); this closes and unregisters the service. Host supplies Nuxt and h3. No automatic registration, permission grant or browser intake. runtimeConfig.logging.presentation and public.loggingPresentation default false; enable both explicitly, set logging.origin to the exact canonical browser origin, configure host route authentication and permission middleware, host request-size/rate limits, and load i18n/locales/en-GB.json through the host i18n configuration. The layer uses host useI18n; no mandatory i18n package is added to the headless core. Routes /logging, /logging/records, /logging/records/:id, /logging/delivery, /logging/settings, /logging/data-management provide a minimal accessible-form candidate with inherited host colours. Host must verify Theme Manager semantic token integration, route guards, focus, contrast and localisation. No SSR data preload. Nuxt compatibility remains unverified.
+
+### Protected HTTP surface
+
+POST /api/logging/operation accepts JSON {operation,input,requestId?}; requires exact configured Origin, application/json, x-logging-request: 1, bounded Content-Length (1–32768 bytes), no chunked body. Host ingress must enforce matching body and request-rate limits and same-origin session/CSRF rules. Operations records/delivery/health/policy/export/erase/restrict/provider/policy.change map exactly to the documented service calls. All use trusted server-side caller resolution and separate permissions; no browser submit or composition-root operation. Malformed requests return safe HTTP errors; service outcomes are returned as typed results, not translated into success claims. Disabled/uncomposed service fails closed. No cache or referrer; host must enforce CSP frame-ancestors and TLS. Browser data is transient and cleared on scope edit; no browser storage or download persistence added.
 
 ## Headless surface
 
