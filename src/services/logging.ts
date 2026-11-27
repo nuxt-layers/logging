@@ -15,6 +15,9 @@ export function createLogging<E>(options: Options<E>) {
   if(store && options.lifecycleJournal && store!==options.lifecycleJournal)throw new Error('LOG_INVALID_CONFIG')
   const journal = store ?? options.lifecycleJournal
   let relayBusy=false
+  let journalCursor:string|undefined
+  const journalRetention=options.journalRetention?{...options.journalRetention}:undefined
+  if(journalRetention&&(!journal?.maintenance||!bounded(journalRetention.retentionMs,3650*86400000)||typeof journalRetention.resolvePreservation!=='function'))throw new Error('LOG_INVALID_CONFIG')
   if (!bounded(capacity,10000) || !bounded(rate,10000) || !bounded(timeout,30000) || !bounded(retention,86400000*30) || !token(revision) || !localSink || typeof localSink.write !== 'function') throw new Error('LOG_INVALID_CONFIG')
   const external = new Map<string,{sink:typeof localSink;maxAttempts:number}>()
   for (const target of options.externalSinks ?? []) {
@@ -274,7 +277,7 @@ export function createLogging<E>(options: Options<E>) {
   }
   // Composition-root-only relay. Acknowledgement is after publisher confirmation; duplicates are possible.
   async function relayLifecycle(publish:LifecyclePublisher,limit=20) {
-    if(!journal||relayBusy||closing||closed||!bounded(limit,100))return {status:'unavailable' as const,published:0}
+    if(!journal||relayBusy||lifecycleBusy||closing||closed||!bounded(limit,100))return {status:'unavailable' as const,published:0}
     relayBusy=true
     let published=0
     try {
@@ -287,7 +290,8 @@ export function createLogging<E>(options: Options<E>) {
         try {
           const result=await Promise.race([Promise.resolve().then(()=>publish(event,controller.signal)),new Promise<Delivery>(resolve=>{timer=setTimeout(()=>{controller.abort();resolve('uncertain')},timeout)})])
           if(result!=='delivered')return {status:result==='refused'?'unavailable' as const:'uncertain' as const,published}
-          await journal.acknowledge(event.id)
+          const stamp=time()
+          await journal.acknowledge(event.id,stamp.quality==='verified'?stamp.instant:undefined)
           published++
         } catch {return {status:'uncertain' as const,published}}
         finally {if(timer!==undefined)clearTimeout(timer)}
@@ -325,6 +329,31 @@ export function createLogging<E>(options: Options<E>) {
     } catch {return {status:'uncertain' as const,removed,held}}
     finally {lifecycleBusy=false}
   }
+  // Only acknowledged event payloads are eligible; request identities and tombstones are never pruned here.
+  async function maintainJournal(limit=20) {
+    const maintenance=journal?.maintenance
+    if(!maintenance||!journalRetention||relayBusy||busy||lifecycleBusy||closing||closed||!bounded(limit,100))return {status:'unavailable' as const,removed:0,held:0}
+    lifecycleBusy=true
+    let removed=0,held=0
+    try {
+      const t=time()
+      if(t.quality!=='verified')return {status:'unavailable' as const,removed,held}
+      const before=new Date(t.ms-journalRetention.retentionMs).toISOString()
+      const events=await maintenance.acknowledgedBefore(before,limit,journalCursor)
+      if(!Array.isArray(events)||events.length>limit)return {status:'unavailable' as const,removed,held}
+      for(const event of events) {
+        if(closing||closed)return {status:'unavailable' as const,removed,held}
+        if(!token(event.id)||!instant(event.committedAt))return {status:'unavailable' as const,removed,held}
+        journalCursor=event.id
+        if(await journalRetention.resolvePreservation(event)!=='clear'){held++;continue}
+        if(closing||closed)return {status:'unavailable' as const,removed,held}
+        if(await maintenance.removeAcknowledged(event.id,before)==='removed')removed++
+      }
+      if(events.length<limit)journalCursor=undefined
+      return {status:'completed' as const,removed,held}
+    } catch {return {status:'uncertain' as const,removed,held}}
+    finally {lifecycleBusy=false}
+  }
   function close() {
     closing=true;closed=true;activeAbort?.abort();rows.length=0;buckets.clear()
   }
@@ -338,5 +367,5 @@ export function createLogging<E>(options: Options<E>) {
       return await Promise.race([pending.then(()=>({status:'completed' as const})),new Promise<{status:'uncertain'}>(resolve=>{timer=setTimeout(()=>resolve({status:'uncertain'}),timeout)})])
     } finally {if(timer!==undefined)clearTimeout(timer)}
   }
-  return {maintainRetention,relayLifecycle,submit,readDiagnostics,readDeliveryState,readEffectivePolicy,readPipelineHealth,exportDiagnostics,eraseDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'erase',target,requestId),restrictDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'restrict',target,requestId),hostHealth:()=>({state:closed||quarantined.size?'degraded' as const:(busy||lifecycleBusy)?'busy' as const:'unknown' as const,lastDelivery,drops,uncertain,buffered:rows.length,quarantined:[...quarantined]}),close,shutdown}
+  return {maintainJournal,maintainRetention,relayLifecycle,submit,readDiagnostics,readDeliveryState,readEffectivePolicy,readPipelineHealth,exportDiagnostics,eraseDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'erase',target,requestId),restrictDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'restrict',target,requestId),hostHealth:()=>({state:closed||quarantined.size?'degraded' as const:(busy||lifecycleBusy)?'busy' as const:'unknown' as const,lastDelivery,drops,uncertain,buffered:rows.length,quarantined:[...quarantined]}),close,shutdown}
 }

@@ -31,6 +31,8 @@ export function createSqliteLifecycleJournal(path) {
         acknowledged INTEGER NOT NULL DEFAULT 0 CHECK(acknowledged IN (0,1))
       );
     `)
+    // Additive migration: legacy acknowledgements have unknown time and cannot be compacted.
+    if(!db.prepare('PRAGMA table_info(logging_outbox)').all().some(c=>c.name==='acknowledged_at'))db.exec('ALTER TABLE logging_outbox ADD COLUMN acknowledged_at INTEGER')
   } catch (error) { db.close(); throw error }
   const lookup = db.prepare('SELECT fingerprint FROM logging_requests WHERE tenant=? AND source=? AND request=?')
   const insertRequest = db.prepare('INSERT INTO logging_requests VALUES(?,?,?,?)')
@@ -40,7 +42,7 @@ export function createSqliteLifecycleJournal(path) {
   const state = db.prepare('SELECT state FROM logging_lifecycle WHERE tenant=? AND source=? AND record=?')
   const insertEvent = db.prepare('INSERT INTO logging_outbox(id,payload) VALUES(?,?)')
   const pending = db.prepare('SELECT payload FROM logging_outbox WHERE acknowledged=0 ORDER BY seq LIMIT ?')
-  const acknowledge = db.prepare('UPDATE logging_outbox SET acknowledged=1 WHERE id=?')
+  const acknowledge = db.prepare('UPDATE logging_outbox SET acknowledged=1, acknowledged_at=? WHERE id=? AND acknowledged=0')
   return {
     async save(entry,capacity) {
       if(!Number.isSafeInteger(capacity)||capacity<1||capacity>10000)return 'uncertain'
@@ -111,7 +113,22 @@ export function createSqliteLifecycleJournal(path) {
       if(!Number.isSafeInteger(limit)||limit<1||limit>100)throw new Error('LOG_INVALID_LIMIT')
       return pending.all(limit).map(row=>JSON.parse(row.payload))
     },
-    async acknowledge(eventId) { acknowledge.run(eventId) },
+    async acknowledge(eventId,acknowledgedAt) {
+      const ms=Date.parse(acknowledgedAt??'')
+      acknowledge.run(Number.isFinite(ms)?ms:null,eventId)
+    },
+    maintenance: {
+      async acknowledgedBefore(before,limit,after) {
+        const ms=Date.parse(before)
+        if(!Number.isFinite(ms)||!Number.isSafeInteger(limit)||limit<1||limit>100)throw new Error('LOG_INVALID_LIMIT')
+        return db.prepare('SELECT payload FROM logging_outbox WHERE acknowledged=1 AND acknowledged_at<=? AND id>? ORDER BY id LIMIT ?').all(ms,after??'',limit).map(row=>JSON.parse(row.payload))
+      },
+      async removeAcknowledged(eventId,before) {
+        const ms=Date.parse(before)
+        if(!Number.isFinite(ms))throw new Error('LOG_INVALID_LIMIT')
+        return db.prepare('DELETE FROM logging_outbox WHERE id=? AND acknowledged=1 AND acknowledged_at<=?').run(eventId,ms).changes?'removed':'absent'
+      }
+    },
     close() { db.close() }
   }
 }

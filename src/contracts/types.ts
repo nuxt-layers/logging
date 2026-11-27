@@ -49,11 +49,20 @@ export type PreservationDecision = 'clear'|'held'|'unknown'
 export type OptionsRetention = {
   resolvePreservation(target:LifecycleTarget):Promise<PreservationDecision>
 }
+export type JournalMaintenance = {
+  acknowledgedBefore(before:string,limit:number,after?:string):Promise<LifecycleEvent[]>
+  removeAcknowledged(eventId:string,before:string):Promise<'removed'|'absent'>
+}
+export type JournalRetentionAuthority = {
+  retentionMs:number
+  resolvePreservation(event:LifecycleEvent):Promise<PreservationDecision>
+}
 export type LifecycleJournal = {
   commit(command:LifecycleCommit):Promise<'committed'|'duplicate'|'conflict'|'uncertain'>
   visibility(target:LifecycleTarget):Promise<'visible'|'restricted'|'erased'>
   pending(limit:number):Promise<LifecycleEvent[]>
-  acknowledge(eventId:string):Promise<void>
+  acknowledge(eventId:string,acknowledgedAt?:string):Promise<void>
+  maintenance?: JournalMaintenance
 }
 export type LifecyclePublisher = (event:LifecycleEvent,signal:AbortSignal)=>Promise<Delivery>
 export type Options<E> = {
@@ -73,6 +82,7 @@ export type Options<E> = {
   lifecycleJournal?: LifecycleJournal
   diagnosticStore?: DiagnosticStore
   retentionAuthority?: OptionsRetention
+  journalRetention?: JournalRetentionAuthority
   approveLifecycle?: (request:LifecycleApproval) => Promise<LifecycleDecision>
   resolvePolicy?: (scope:{tenantId:string;source:string}) => Promise<Policy | null>
 }

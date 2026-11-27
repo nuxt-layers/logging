@@ -119,11 +119,20 @@ export type PreservationDecision = 'clear'|'held'|'unknown'
 export type OptionsRetention = {
   resolvePreservation(target:LifecycleTarget):Promise<PreservationDecision>
 }
+export type JournalMaintenance = {
+  acknowledgedBefore(before:string,limit:number,after?:string):Promise<LifecycleEvent[]>
+  removeAcknowledged(eventId:string,before:string):Promise<'removed'|'absent'>
+}
+export type JournalRetentionAuthority = {
+  retentionMs:number
+  resolvePreservation(event:LifecycleEvent):Promise<PreservationDecision>
+}
 export type LifecycleJournal = {
   commit(command:LifecycleCommit):Promise<'committed'|'duplicate'|'conflict'|'uncertain'>
   visibility(target:LifecycleTarget):Promise<'visible'|'restricted'|'erased'>
   pending(limit:number):Promise<LifecycleEvent[]>
-  acknowledge(eventId:string):Promise<void>
+  acknowledge(eventId:string,acknowledgedAt?:string):Promise<void>
+  maintenance?: JournalMaintenance
 }
 export type LifecyclePublisher = (event:LifecycleEvent,signal:AbortSignal)=>Promise<Delivery>
 export type Options<E> = {
@@ -143,6 +152,7 @@ export type Options<E> = {
   lifecycleJournal?: LifecycleJournal
   diagnosticStore?: DiagnosticStore
   retentionAuthority?: OptionsRetention
+  journalRetention?: JournalRetentionAuthority
   approveLifecycle?: (request:LifecycleApproval) => Promise<LifecycleDecision>
   resolvePolicy?: (scope:{tenantId:string;source:string}) => Promise<Policy | null>
 }
@@ -193,6 +203,7 @@ interface LoggingSurface<E> {
   exportDiagnostics(event:E,query:DiagnosticQuery,requestId:string):Promise<ExportResult>
   eraseDiagnostic(event:E,target:LifecycleTarget,requestId:string):Promise<LifecycleResult>
   restrictDiagnostic(event:E,target:LifecycleTarget,requestId:string):Promise<LifecycleResult>
+  maintainJournal(limit?:number):Promise<{status:'completed'|'unavailable'|'uncertain';removed:number;held:number}>
   maintainRetention(limit?:number):Promise<{status:'completed'|'unavailable'|'uncertain';removed:number;held:number}>
   relayLifecycle(publish:LifecyclePublisher,limit?:number):Promise<{status:'completed'|'unavailable'|'uncertain';published:number}>
   hostHealth(): HostHealth
@@ -273,13 +284,17 @@ Import createSqliteLifecycleJournal(path) from '@nuxt-layers/logging/sqlite' and
 
 The journal atomically commits restriction/erasure state, request identity and a version-1 lifecycle event. Duplicate tenant/source/request with identical action, target, subject and evidence reference is idempotent; changed content is conflict (rejected). Erasure is terminal for that record ID; a subsequent restriction request conflicts. A committed result means the Logging-owned lifecycle state and event committed, not external sink deletion; providerState remains unknown. Uncertain commit closes intake and clears local history; recompose and reconcile via the durable journal. All diagnostic projections check journal visibility; lookup errors fail closed (internal LOG_JOURNAL, surfaced as unavailable). When configured as diagnosticStore (rather than lifecycleJournal alone), the same adapter persists sanitised diagnostic records and delivery projections. Existing holds still require independent preservation approval; journal is not the legal authority.
 
-LifecycleEvent contains stable ID, version, event type, tenant/source, opaque record/request/subject/evidence references and commit UTC. No diagnostic payload. Events describe committed Logging state only, not Audit custody or provider erasure. Host must classify references and restrict event recipients. relayLifecycle(publish, limit=20) is a composition-root-only pull/ack operation, max 100, one relay in flight per instance. Publisher returns delivered only after durable downstream acknowledgement. Refusal or uncertainty leaves the event pending; acknowledgement failure may duplicate delivery. Consumers deduplicate on event ID. Host schedules relay and must use a single active relay per journal; no distributed lease or automatic retries. Acknowledged events and request/tombstone state are retained until a governed retention mechanism is implemented; bounded relay batches do not bound database growth. No Message Queue integration is presumed. Host bounds journal operations and closes the adapter after all work settles.
+LifecycleEvent contains stable ID, version, event type, tenant/source, opaque record/request/subject/evidence references and commit UTC. No diagnostic payload. Events describe committed Logging state only, not Audit custody or provider erasure. Host must classify references and restrict event recipients. relayLifecycle(publish, limit=20) is a composition-root-only pull/ack operation, max 100, one relay in flight per instance. Publisher returns delivered only after durable downstream acknowledgement. Refusal or uncertainty leaves the event pending; acknowledgement failure may duplicate delivery. Consumers deduplicate on event ID. Host schedules relay and must use a single active relay per journal; no distributed lease or automatic retries. Acknowledged event payloads may be pruned only through governed journal maintenance; request/tombstone state is retained. Bounded relay batches do not bound database growth. No Message Queue integration is presumed. Host bounds journal operations and closes the adapter after all work settles.
 
 ### Optional diagnostic persistence and retention maintenance
 
 Pass createSqliteLifecycleJournal(path) as diagnosticStore; it also supplies the lifecycle journal. A different lifecycleJournal alongside it is rejected. The store commits the sanitised envelope before sink invocation and persists observed delivery outcomes. Recovered records are read directly from the scoped store, not replayed to sinks. Empty/incomplete delivery arrays mean no confirmed result was persisted, not successful delivery. A refused or uncertain sink may still leave a diagnostic record. Store uncertainty closes intake; recompose and investigate. The capacity limit applies to persisted records across tenants; held records consume capacity, no silent eviction. Host must use one active service writer per store and coordinate provider/disclosure operations. Store is trusted infrastructure; validate its implementation before deployment.
 
-Ordinary projections exclude records at or beyond their applicable retention limit even when preserved in storage. maintainRetention(limit=20) is composition-root-only, max 100 per call; verified clock and a qualified retentionAuthority are required. Explicit clear permits deletion from Logging's own diagnostic store; held/unknown are retained. No automatic maintenance, provider erasure, legal-authority or physical-media deletion guarantee. Host must ensure preservation decisions remain valid through deletion and coordinate concurrent hold changes. Held records consume capacity but do not permanently block subsequent maintenance pages. Journal tombstones, request fingerprints and events are not deleted by diagnostic retention. Purpose-specific limits are supported through purposeRetention, an optional map from approved rule purpose to positive integer milliseconds no greater than retentionMs. Unknown purposes or invalid limits reject composition. Each new record carries its admission-time limit; reads and maintenance use the minimum of that limit, current purpose limit and global limit, so recomposition cannot extend an admitted limit. Older records without a limit use current settings. Maintenance scans bounded pages by stable tenant/source/record key, advancing past held and nonexpired records and wrapping at the end. This is a process-local cursor, not a completion proof. Governed journal compaction and provider-level lifecycle remain outstanding.
+Ordinary projections exclude records at or beyond their applicable retention limit even when preserved in storage. maintainRetention(limit=20) is composition-root-only, max 100 per call; verified clock and a qualified retentionAuthority are required. Explicit clear permits deletion from Logging's own diagnostic store; held/unknown are retained. No automatic maintenance, provider erasure, legal-authority or physical-media deletion guarantee. Host must ensure preservation decisions remain valid through deletion and coordinate concurrent hold changes. Held records consume capacity but do not permanently block subsequent maintenance pages. Journal tombstones, request fingerprints and events are not deleted by diagnostic retention. Purpose-specific limits are supported through purposeRetention, an optional map from approved rule purpose to positive integer milliseconds no greater than retentionMs. Unknown purposes or invalid limits reject composition. Each new record carries its admission-time limit; reads and maintenance use the minimum of that limit, current purpose limit and global limit, so recomposition cannot extend an admitted limit. Older records without a limit use current settings. Maintenance scans bounded pages by stable tenant/source/record key, advancing past held and nonexpired records and wrapping at the end. This is a process-local cursor, not a completion proof. Governed disposal of request identities and tombstones, and provider-level lifecycle remain outstanding.
+
+### Governed journal maintenance
+
+Optional journalRetention supplies an approved positive retentionMs (maximum 3650 days) and independent resolvePreservation(event) callback. Requires a journal implementing maintenance. maintainJournal(limit=20) is composition-root-only, maximum 100 events per scan, requires verified clock and explicit clear preservation per event. Only acknowledged event payloads with verified acknowledgement timestamps at or before the cutoff are eligible. Unknown acknowledgement times, pending events, held or unknown preservation are never deleted. The adapter rechecks acknowledgement and cutoff at deletion. Rotating scans advance past held entries and wrap; completed means a batch completed, not that the journal is empty. Request identities and restriction/erasure markers remain intact; their governed disposal remains outstanding. Host coordinates concurrent preservation changes and independent evidence retention. No physical-media deletion or backup removal claim. Legacy acknowledged events lacking timestamp are retained.
 
 ## Permissions
 
@@ -294,7 +309,7 @@ Ordinary projections exclude records at or beyond their applicable retention lim
 | logging.erase | Requested tenantId/source | Remove local projection; clear preservation required |
 | logging.restrict | Requested tenantId/source | Hide local projection |
 
-All require affirmative server-side resource decisions; queries require matching trusted tenant before lookup. Separate permissions are not interchangeable. hostHealth, close and shutdown are composition-root-only, not user-facing permissions. No cross-tenant override or privilege bypass. Local protected commands additionally require independently attributable approval. Provider-level rights and privileged policy mutation remain unavailable. relayLifecycle and maintainRetention are composition-root-only.
+All require affirmative server-side resource decisions; queries require matching trusted tenant before lookup. Separate permissions are not interchangeable. hostHealth, close and shutdown are composition-root-only, not user-facing permissions. No cross-tenant override or privilege bypass. Local protected commands additionally require independently attributable approval. Provider-level rights and privileged policy mutation remain unavailable. relayLifecycle, maintainRetention and maintainJournal are composition-root-only.
 
 ## Screens
 

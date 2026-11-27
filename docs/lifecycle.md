@@ -9,3 +9,5 @@ Continuation on accepted master d6009b9c1299c9c12417866fd230a201a669eced: option
 Persistent diagnostic store implemented in same journal database, before-sink persistence, scoped recovery without replay, bounded capacity, observed delivery updates, atomic explicit erasure, verified-clock preservation-aware maintenance. Purpose-specific retention, journal compaction and provider lifecycle remain outstanding. No test execution by AI.
 
 Architecture master rechecked at e9dac240c16891fcbed9669228dac6cd5cde9c3c. Purpose-specific retention and rotating maintenance scans implemented. Journal evidence compaction requires explicit governed retention and is not performed by this batch.
+
+Governed acknowledged-event payload pruning implemented with verified acknowledgement time, bounded rotating scan, explicit preservation clearance and conditional deletion. Request identity and marker retirement remain intentionally unsupported.
