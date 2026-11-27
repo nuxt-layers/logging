@@ -64,9 +64,13 @@ export function createSqliteLifecycleJournal(path) {
     async updateDelivery(target,delivery) {
       db.prepare('UPDATE logging_diagnostics SET delivery=? WHERE tenant=? AND source=? AND record=?').run(JSON.stringify(delivery),target.tenantId,target.source,target.id)
     },
-    async expired(before,limit) {
+    async expired(before,limit,after) {
       if(!Number.isSafeInteger(limit)||limit<1||limit>100||!Number.isFinite(Date.parse(before)))throw new Error('LOG_INVALID_LIMIT')
-      return db.prepare('SELECT tenant AS tenantId,source,record AS id FROM logging_diagnostics WHERE receipt<=? ORDER BY receipt,tenant,source,record LIMIT ?').all(Date.parse(before),limit)
+      return after ? db.prepare('SELECT tenant AS tenantId,source,record AS id FROM logging_diagnostics WHERE receipt<=? AND (tenant,source,record)>(?,?,?) ORDER BY tenant,source,record LIMIT ?').all(Date.parse(before),after.tenantId,after.source,after.id,limit) : db.prepare('SELECT tenant AS tenantId,source,record AS id FROM logging_diagnostics WHERE receipt<=? ORDER BY tenant,source,record LIMIT ?').all(Date.parse(before),limit)
+    },
+    async retentionRecord(target) {
+      const row=db.prepare('SELECT payload FROM logging_diagnostics WHERE tenant=? AND source=? AND record=?').get(target.tenantId,target.source,target.id)
+      return row?JSON.parse(row.payload):null
     },
     async expire(target,before) {
       const result=db.prepare('DELETE FROM logging_diagnostics WHERE tenant=? AND source=? AND record=? AND receipt<=?').run(target.tenantId,target.source,target.id,Date.parse(before))

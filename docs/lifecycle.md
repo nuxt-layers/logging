@@ -7,3 +7,5 @@ Outstanding: durable Logging-owned state and transactional outbox, provider-qual
 Continuation on accepted master d6009b9c1299c9c12417866fd230a201a669eced: optional durable lifecycle journal, concrete Node SQLite implementation, atomic tombstone/request/outbox commit, scoped visibility checks and bounded explicit relay. Diagnostic persistence, provider-level holds/deletion, export events, policy mutations, distributed relay coordination and governed journal retention remain outstanding. No CI evidence yet.
 
 Persistent diagnostic store implemented in same journal database, before-sink persistence, scoped recovery without replay, bounded capacity, observed delivery updates, atomic explicit erasure, verified-clock preservation-aware maintenance. Purpose-specific retention, journal compaction and provider lifecycle remain outstanding. No test execution by AI.
+
+Architecture master rechecked at e9dac240c16891fcbed9669228dac6cd5cde9c3c. Purpose-specific retention and rotating maintenance scans implemented. Journal evidence compaction requires explicit governed retention and is not performed by this batch.

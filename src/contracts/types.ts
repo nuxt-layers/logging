@@ -2,7 +2,7 @@ export type Severity = 'debug' | 'info' | 'warn' | 'error' | 'fatal'
 export type Caller = { tenantId: string; subjectId: string | null; assurance: unknown }
 export type Producer = Caller & { source: string }
 export type Diagnostic = { version: 1; code: string; severity: Severity; occurrenceTime: string; correlation?: string; attributes?: Record<string, number | boolean> }
-export type RecordEntry = Readonly<{ id: string; tenantId: string; source: string; code: string; severity: Severity; occurrenceTime: string; receiptTime: string; timeQuality: 'verified' | 'degraded' | 'unknown'; correlation?: string; attributes: Readonly<Record<string, number | boolean>>; policyRevision: string; purpose: string; category: string; classification: 'technical' }>
+export type RecordEntry = Readonly<{ id: string; tenantId: string; source: string; code: string; severity: Severity; occurrenceTime: string; receiptTime: string; timeQuality: 'verified' | 'degraded' | 'unknown'; correlation?: string; attributes: Readonly<Record<string, number | boolean>>; policyRevision: string; purpose: string; category: string; classification: 'technical'; retentionMs?:number }>
 export type Delivery = 'delivered' | 'refused' | 'uncertain'
 export type Receipt = { status: 'accepted' | 'rejected' | 'throttled' | 'unavailable' | 'uncertain'; code: string; id?: string }
 export type Sink = { write(record: RecordEntry, signal: AbortSignal): Promise<Delivery> }
@@ -41,8 +41,9 @@ export type DiagnosticStore = LifecycleJournal & {
   save(entry:StoredDiagnostic,capacity:number):Promise<'stored'|'full'|'uncertain'>
   load(tenantId:string,source:string,limit:number):Promise<StoredDiagnostic[]>
   updateDelivery(target:LifecycleTarget,delivery:DeliveryState[]):Promise<void>
-  expired(before:string,limit:number):Promise<LifecycleTarget[]>
+  expired(before:string,limit:number,after?:LifecycleTarget):Promise<LifecycleTarget[]>
   expire(target:LifecycleTarget,before:string):Promise<'removed'|'absent'>
+  retentionRecord(target:LifecycleTarget):Promise<RecordEntry|null>
 }
 export type PreservationDecision = 'clear'|'held'|'unknown'
 export type OptionsRetention = {
@@ -65,6 +66,7 @@ export type Options<E> = {
   policyRevision: string
   capacity?: number
   retentionMs: number
+  purposeRetention?: Readonly<Record<string,number>>
   ratePerMinute?: number
   timeoutMs?: number
   externalSinks?: readonly ExternalSink[]

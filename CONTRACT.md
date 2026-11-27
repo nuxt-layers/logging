@@ -72,7 +72,7 @@ export type Severity = 'debug' | 'info' | 'warn' | 'error' | 'fatal'
 export type Caller = { tenantId: string; subjectId: string | null; assurance: unknown }
 export type Producer = Caller & { source: string }
 export type Diagnostic = { version: 1; code: string; severity: Severity; occurrenceTime: string; correlation?: string; attributes?: Record<string, number | boolean> }
-export type RecordEntry = Readonly<{ id: string; tenantId: string; source: string; code: string; severity: Severity; occurrenceTime: string; receiptTime: string; timeQuality: 'verified' | 'degraded' | 'unknown'; correlation?: string; attributes: Readonly<Record<string, number | boolean>>; policyRevision: string; purpose: string; category: string; classification: 'technical' }>
+export type RecordEntry = Readonly<{ id: string; tenantId: string; source: string; code: string; severity: Severity; occurrenceTime: string; receiptTime: string; timeQuality: 'verified' | 'degraded' | 'unknown'; correlation?: string; attributes: Readonly<Record<string, number | boolean>>; policyRevision: string; purpose: string; category: string; classification: 'technical'; retentionMs?:number }>
 export type Delivery = 'delivered' | 'refused' | 'uncertain'
 export type Receipt = { status: 'accepted' | 'rejected' | 'throttled' | 'unavailable' | 'uncertain'; code: string; id?: string }
 export type Sink = { write(record: RecordEntry, signal: AbortSignal): Promise<Delivery> }
@@ -111,8 +111,9 @@ export type DiagnosticStore = LifecycleJournal & {
   save(entry:StoredDiagnostic,capacity:number):Promise<'stored'|'full'|'uncertain'>
   load(tenantId:string,source:string,limit:number):Promise<StoredDiagnostic[]>
   updateDelivery(target:LifecycleTarget,delivery:DeliveryState[]):Promise<void>
-  expired(before:string,limit:number):Promise<LifecycleTarget[]>
+  expired(before:string,limit:number,after?:LifecycleTarget):Promise<LifecycleTarget[]>
   expire(target:LifecycleTarget,before:string):Promise<'removed'|'absent'>
+  retentionRecord(target:LifecycleTarget):Promise<RecordEntry|null>
 }
 export type PreservationDecision = 'clear'|'held'|'unknown'
 export type OptionsRetention = {
@@ -135,6 +136,7 @@ export type Options<E> = {
   policyRevision: string
   capacity?: number
   retentionMs: number
+  purposeRetention?: Readonly<Record<string,number>>
   ratePerMinute?: number
   timeoutMs?: number
   externalSinks?: readonly ExternalSink[]
@@ -277,7 +279,7 @@ LifecycleEvent contains stable ID, version, event type, tenant/source, opaque re
 
 Pass createSqliteLifecycleJournal(path) as diagnosticStore; it also supplies the lifecycle journal. A different lifecycleJournal alongside it is rejected. The store commits the sanitised envelope before sink invocation and persists observed delivery outcomes. Recovered records are read directly from the scoped store, not replayed to sinks. Empty/incomplete delivery arrays mean no confirmed result was persisted, not successful delivery. A refused or uncertain sink may still leave a diagnostic record. Store uncertainty closes intake; recompose and investigate. The capacity limit applies to persisted records across tenants; held records consume capacity, no silent eviction. Host must use one active service writer per store and coordinate provider/disclosure operations. Store is trusted infrastructure; validate its implementation before deployment.
 
-Ordinary projections exclude records older than retentionMs even when preserved in storage. maintainRetention(limit=20) is composition-root-only, max 100 per call; verified clock and a qualified retentionAuthority are required. Explicit clear permits deletion from Logging's own diagnostic store; held/unknown are retained. No automatic maintenance, provider erasure, legal-authority or physical-media deletion guarantee. Host must ensure preservation decisions remain valid through deletion and coordinate concurrent hold changes. Old held records may occupy the bounded maintenance scan; the host must reconcile them. Journal tombstones, request fingerprints and events are not deleted by diagnostic retention. Purpose-specific rules, governed journal compaction and provider-level lifecycle remain outstanding.
+Ordinary projections exclude records at or beyond their applicable retention limit even when preserved in storage. maintainRetention(limit=20) is composition-root-only, max 100 per call; verified clock and a qualified retentionAuthority are required. Explicit clear permits deletion from Logging's own diagnostic store; held/unknown are retained. No automatic maintenance, provider erasure, legal-authority or physical-media deletion guarantee. Host must ensure preservation decisions remain valid through deletion and coordinate concurrent hold changes. Held records consume capacity but do not permanently block subsequent maintenance pages. Journal tombstones, request fingerprints and events are not deleted by diagnostic retention. Purpose-specific limits are supported through purposeRetention, an optional map from approved rule purpose to positive integer milliseconds no greater than retentionMs. Unknown purposes or invalid limits reject composition. Each new record carries its admission-time limit; reads and maintenance use the minimum of that limit, current purpose limit and global limit, so recomposition cannot extend an admitted limit. Older records without a limit use current settings. Maintenance scans bounded pages by stable tenant/source/record key, advancing past held and nonexpired records and wrapping at the end. This is a process-local cursor, not a completion proof. Governed journal compaction and provider-level lifecycle remain outstanding.
 
 ## Permissions
 

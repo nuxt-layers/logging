@@ -1,4 +1,4 @@
-import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision, LifecyclePublisher, StoredDiagnostic, DiagnosticStore } from '../contracts/types.ts'
+import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision, LifecyclePublisher } from '../contracts/types.ts'
 import { token, instant, bounded, levels, compileRules, effectiveRules, validateDiagnostic, diagnosticCode, plain, fields } from '../policy/validation.ts'
 import { deliver } from '../sinks/delivery.ts'
 
@@ -22,6 +22,12 @@ export function createLogging<E>(options: Options<E>) {
     external.set(target.id,{sink:target.sink,maxAttempts:target.maxAttempts ?? 1})
   }
   const floors = compileRules(options.rules,new Set(external.keys()))
+  const purposeRetention = new Map(Object.entries(options.purposeRetention??{}))
+  for(const [purpose,ms] of purposeRetention)if(!token(purpose)||!bounded(ms,retention)||![...floors.values()].some(r=>r.purpose===purpose))throw new Error('LOG_INVALID_CONFIG')
+  function retentionFor(record:RecordEntry) {
+    return Math.min(retention,purposeRetention.get(record.purpose)??retention,record.retentionMs??retention)
+  }
+  let retentionCursor:LifecycleTarget|undefined
   const rows: {record:RecordEntry;delivery:DeliveryState[];restricted:boolean}[] = []
   const buckets = new Map<string,{count:number;minute:number}>()
   // Uncertain external sinks remain quarantined until recomposition, so ignored aborts cannot accumulate.
@@ -43,7 +49,7 @@ export function createLogging<E>(options: Options<E>) {
   function expire(ms:number) {
     for(let i=rows.length-1;i>=0;i--) {
       const row=rows[i]
-      if(row && ms-Date.parse(row.record.receiptTime)>=retention) rows.splice(i,1)
+      if(row && ms-Date.parse(row.record.receiptTime)>=retentionFor(row.record)) rows.splice(i,1)
     }
   }
   async function authorised(event:E,action:string,tenantId:string,source:string) {
@@ -80,7 +86,7 @@ export function createLogging<E>(options: Options<E>) {
       b.count++;buckets.set(key,b)
       if(levels.indexOf(d.severity)<levels.indexOf(rule.minimumSeverity??'debug') || (b.count-1)%(rule.sampleEvery??1)!==0) {drops++;return {status:'rejected',code:'LOG_FILTERED'}}
       if((!store&&rows.length>=capacity) || closing || closed) {drops++;return {status:'unavailable',code:'LOG_CAPACITY'}}
-      const row:RecordEntry=Object.freeze({id:crypto.randomUUID(),tenantId:producer.tenantId,source:producer.source,code:d.code,severity:d.severity,occurrenceTime:d.occurrenceTime,receiptTime:t.instant,timeQuality:t.quality,correlation:d.correlation,attributes:Object.freeze(d.attributes??{}),policyRevision:p.revision,purpose:rule.purpose,category:rule.category??'technical',classification:'technical'})
+      const row:RecordEntry=Object.freeze({id:crypto.randomUUID(),tenantId:producer.tenantId,source:producer.source,code:d.code,severity:d.severity,occurrenceTime:d.occurrenceTime,receiptTime:t.instant,timeQuality:t.quality,correlation:d.correlation,attributes:Object.freeze(d.attributes??{}),policyRevision:p.revision,purpose:rule.purpose,category:rule.category??'technical',classification:'technical',retentionMs:purposeRetention.get(rule.purpose)??retention})
       // Persist the sanitised record before invoking any sink. Recovery never replays writes.
       if(store) {
         let saved
@@ -141,7 +147,7 @@ export function createLogging<E>(options: Options<E>) {
   async function visibleEntries(q:DiagnosticQuery) {
     const loaded=store?await store.load(q.tenantId,q.source,10000):rows
     if(store&&loaded.length>10000)throw new Error('LOG_JOURNAL')
-    const candidates=loaded.filter(x=>!('restricted' in x && x.restricted)&&matches(q,x.record)&&(!store||Date.parse(x.record.receiptTime)>lastTime-retention))
+    const candidates=loaded.filter(x=>!('restricted' in x && x.restricted)&&matches(q,x.record)&&(!store||Date.parse(x.record.receiptTime)>lastTime-retentionFor(x.record)))
     if(!journal)return candidates
     const result:typeof candidates=[]
     for(const x of candidates) {
@@ -298,16 +304,23 @@ export function createLogging<E>(options: Options<E>) {
     try {
       const t=time()
       if(t.quality!=='verified')return {status:'unavailable' as const,removed,held}
-      const before=new Date(t.ms-retention).toISOString()
-      const targets=await store.expired(before,limit)
+      const before=t.instant
+      const targets=await store.expired(before,limit,retentionCursor)
+      if(targets.length===0){retentionCursor=undefined;return {status:'completed' as const,removed,held}}
       if(targets.length>limit)return {status:'unavailable' as const,removed,held}
       for(const target of targets) {
         if(closing||closed)return {status:'unavailable' as const,removed,held}
+        retentionCursor=target
+        const record=await store.retentionRecord(target)
+        if(!record||record.tenantId!==target.tenantId||record.source!==target.source||record.id!==target.id)continue
+        const cutoff=new Date(t.ms-retentionFor(record)).toISOString()
+        if(Date.parse(record.receiptTime)>Date.parse(cutoff))continue
         const decision=await options.retentionAuthority.resolvePreservation(target)
         if(decision!=='clear'){held++;continue}
         if(closing||closed)return {status:'unavailable' as const,removed,held}
-        if(await store.expire(target,before)==='removed')removed++
+        if(await store.expire(target,cutoff)==='removed')removed++
       }
+      if(targets.length<limit)retentionCursor=undefined
       return {status:'completed' as const,removed,held}
     } catch {return {status:'uncertain' as const,removed,held}}
     finally {lifecycleBusy=false}

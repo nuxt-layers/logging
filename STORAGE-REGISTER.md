@@ -5,3 +5,5 @@ Process-local diagnostic history: bounded trusted tenant/source, codes, opaque c
 Optional Logging-owned SQLite journal: persistent restriction/erasure tombstones, scoped request fingerprints, outbox events with opaque subject/evidence references and acknowledgement flag. WAL and backups contain the same sensitive operational metadata. Host selects secured file location, permissions and backup controls. No automated retention or compaction yet; do not deploy unbounded journal for regulated workloads without approved retention. No diagnostic payload persisted by this adapter.
 
 Optional diagnostic store persists sanitised records and delivery state in the same database. Capacity max 10000. Expiry hides aged records; explicit verified-clock maintenance with clear preservation removes local payloads only. Held/unknown retained. WAL/backups require separate controls. Journal retention still outstanding.
+
+Purpose-specific retention ceilings are recorded on admission; current policy may shorten but not extend the admitted lifetime. Maintenance uses bounded rotating scans and does not delete held/unknown payloads.
