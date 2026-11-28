@@ -144,6 +144,9 @@ export declare function createLogging<E>(options: Options<E>): {
         storage?: undefined;
         withoutDelivery?: undefined;
         severityDistribution?: undefined;
+        destinations?: undefined;
+        scopeIntake?: undefined;
+        scopeIntakeCoverage?: undefined;
         records?: undefined;
         delivered?: undefined;
         exhausted?: undefined;
@@ -162,6 +165,21 @@ export declare function createLogging<E>(options: Options<E>): {
             error: number;
             fatal: number;
         };
+        destinations: {
+            target: string;
+            state: "degraded" | "ready";
+            observedAt: string;
+            exhausted: number;
+            uncertain: number;
+        }[];
+        scopeIntake: {
+            accepted: number;
+            rejected: number;
+            throttled: number;
+            unavailable: number;
+            uncertain: number;
+        } | null;
+        scopeIntakeCoverage: string;
         records: number;
         delivered: number;
         exhausted: number;
@@ -174,6 +192,9 @@ export declare function createLogging<E>(options: Options<E>): {
         storage?: undefined;
         withoutDelivery?: undefined;
         severityDistribution?: undefined;
+        destinations?: undefined;
+        scopeIntake?: undefined;
+        scopeIntakeCoverage?: undefined;
         records?: undefined;
         delivered?: undefined;
         exhausted?: undefined;
