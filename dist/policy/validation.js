@@ -13,7 +13,7 @@ export function compileRules(input, targets) {
         throw new Error('LOG_INVALID_RULE');
     const result = new Map();
     for (const r of input) {
-        if (!r || !token(r.source) || !token(r.code) || !token(r.purpose) || !Array.isArray(r.attributes) || r.attributes.length > 16 || r.attributes.some(k => !token(k) || forbidden.test(k)) || new Set(r.attributes).size !== r.attributes.length || (r.category !== undefined && !token(r.category)) || (r.minimumSeverity !== undefined && !levels.includes(r.minimumSeverity)) || !bounded(r.sampleEvery ?? 1, 10000) || !Array.isArray(r.destinations ?? []) || (r.destinations ?? []).length > 8 || (r.destinations ?? []).some(t => !targets.has(t)) || new Set(r.destinations ?? []).size !== (r.destinations ?? []).length)
+        if (!r || !token(r.source) || !token(r.code) || !token(r.purpose) || !Array.isArray(r.attributes) || r.attributes.length > 16 || r.attributes.some((k) => !token(k) || forbidden.test(k)) || new Set(r.attributes).size !== r.attributes.length || (r.category !== undefined && !token(r.category)) || (r.minimumSeverity !== undefined && !levels.includes(r.minimumSeverity)) || !bounded(r.sampleEvery ?? 1, 10000) || !Array.isArray(r.destinations ?? []) || (r.destinations ?? []).length > 8 || (r.destinations ?? []).some((t) => !token(t) || !targets.has(t)) || new Set(r.destinations ?? []).size !== (r.destinations ?? []).length)
             throw new Error('LOG_INVALID_RULE');
         if (result.has(key(r)))
             throw new Error('LOG_DUPLICATE_RULE');
