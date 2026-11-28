@@ -1,5 +1,5 @@
 import type { H3Event } from 'h3'
-import { createLogging, type Options } from '../../src/index.ts'
+import { createLogging, type Options } from '../../dist/index.js'
 type Service = ReturnType<typeof createLogging<H3Event>>
 const instances = new WeakMap<object, Service>()
 /** Compose once per Nitro application. Never expose this registry to client code. */

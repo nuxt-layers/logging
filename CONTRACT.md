@@ -10,7 +10,7 @@ Logging is a framework-independent technical diagnostic service. It owns sanitis
 {"@nuxt-layers/logging":"github:nuxt-layers/logging#master"}
 ```
 
-Use the accepted development revision; this document describes the current development interface. Node 26.13+ with native TypeScript stripping is targeted. No runtime dependency is required by the core. Nuxt 4.6.4 is an optional peer target; neither runtime/package integration has yet passed acceptance. Import only from the package root or documented Nuxt subpaths.
+Use the accepted development revision; this document describes the current development interface. Node 26.13+ runs compiled ESM JavaScript from dist/index.js; declarations are published at dist/index.d.ts. Git-backed packages include generated dist files, built from source with the pinned TypeScript compiler. Maintainers regenerate and commit dist on source changes; CI checks reproducibility. Consumers do not compile Logging or enable TypeScript stripping in node_modules. No runtime dependency is required by the core. Nuxt 4.6.4 is an optional peer target; neither runtime/package integration has yet passed acceptance. Import only from the package root or documented subpaths.
 
 ```ts
 import { createLogging, type Options } from '@nuxt-layers/logging'
