@@ -40,6 +40,14 @@ export function createLogging(options) {
     // Uncertain external sinks remain quarantined until recomposition, so ignored aborts cannot accumulate.
     const quarantined = new Set();
     let lifecycleBusy = false;
+    let lifecycleAbort;
+    let relayAbort;
+    let lifecycleDone, relayDone;
+    let finishLifecycle, finishRelay;
+    function beginLifecycle() { lifecycleBusy = true; lifecycleDone = new Promise(resolve => { finishLifecycle = resolve; }); }
+    function endLifecycle() { lifecycleBusy = false; finishLifecycle?.(); lifecycleDone = undefined; finishLifecycle = undefined; lifecycleAbort = undefined; }
+    function beginRelay() { relayBusy = true; relayDone = new Promise(resolve => { finishRelay = resolve; }); }
+    function endRelay() { relayBusy = false; finishRelay?.(); relayDone = undefined; finishRelay = undefined; relayAbort = undefined; }
     let busy = false, closed = false, closing = false, drops = 0, uncertain = 0;
     let lastDelivery = 'unknown';
     let lastTime = -Infinity;
@@ -62,10 +70,11 @@ export function createLogging(options) {
                 rows.splice(i, 1);
         }
     }
-    async function authorised(event, action, tenantId, source) {
+    async function authorised(event, action, resource) {
+        const { tenantId, source } = resource;
         try {
             const caller = await options.resolveCaller(event);
-            return !!caller && caller.tenantId === tenantId && token(tenantId) && token(source) && (await options.decide(caller, action, { tenantId, source })).allowed === true;
+            return !!caller && caller.tenantId === tenantId && token(tenantId) && token(source) && (await options.decide(caller, action, Object.freeze({ ...resource }))).allowed === true;
         }
         catch {
             return false;
@@ -243,7 +252,7 @@ export function createLogging(options) {
     }
     async function readDiagnostics(event, query) {
         const snapshot = snapshotQuery(query);
-        if (!snapshot || !validQuery(snapshot) || !await authorised(event, 'logging.read', snapshot.tenantId, snapshot.source))
+        if (!snapshot || !validQuery(snapshot) || !await authorised(event, 'logging.read', snapshot))
             return { status: 'rejected', records: [] };
         try {
             expire(time().ms);
@@ -257,7 +266,7 @@ export function createLogging(options) {
     }
     async function readDeliveryState(event, query) {
         const snapshot = snapshotQuery(query);
-        if (!snapshot || !validQuery(snapshot) || !await authorised(event, 'logging.delivery.read', snapshot.tenantId, snapshot.source))
+        if (!snapshot || !validQuery(snapshot) || !await authorised(event, 'logging.delivery.read', snapshot))
             return { status: 'rejected', records: [] };
         try {
             expire(time().ms);
@@ -272,7 +281,7 @@ export function createLogging(options) {
         if (!plain(scope) || !fields(scope, ['tenantId', 'source']) || !token(scope.tenantId) || !token(scope.source))
             return { status: 'rejected' };
         const { tenantId, source } = scope;
-        if (!await authorised(event, 'logging.policy.read', tenantId, source))
+        if (!await authorised(event, 'logging.policy.read', { tenantId, source }))
             return { status: 'rejected' };
         try {
             const p = await policy(tenantId, source);
@@ -282,13 +291,14 @@ export function createLogging(options) {
             return { status: 'unavailable' };
         }
     }
-    async function lifecycleCaller(event, action, tenantId, source) {
+    async function lifecycleCaller(event, action, resource) {
+        const { tenantId, source } = resource;
         try {
             const caller = await options.resolveCaller(event);
             if (!caller || caller.tenantId !== tenantId || !token(tenantId) || !token(source) || !token(caller.subjectId))
                 return null;
             const snapshot = Object.freeze({ ...caller });
-            return (await options.decide(snapshot, 'logging.' + action, { tenantId, source })).allowed === true ? snapshot : null;
+            return (await options.decide(snapshot, 'logging.' + action, Object.freeze({ ...resource }))).allowed === true ? snapshot : null;
         }
         catch {
             return null;
@@ -301,7 +311,7 @@ export function createLogging(options) {
         try {
             const result = await options.approveLifecycle({ action, caller, requestId, destination, target: Object.freeze(structuredClone(target)) });
             if (result?.status === 'approved' && token(result.evidenceRef) && ['clear', 'held', 'unknown'].includes(result.preservation))
-                return result;
+                return { status: 'approved', evidenceRef: result.evidenceRef, preservation: result.preservation };
             return { status: result?.status === 'blocked' ? 'blocked' : 'unknown' };
         }
         catch {
@@ -312,12 +322,12 @@ export function createLogging(options) {
         const q = snapshotQuery(query);
         if (!q || !validQuery(q) || !token(requestId))
             return { status: 'rejected', records: [] };
-        const caller = await lifecycleCaller(event, 'export', q.tenantId, q.source);
+        const caller = await lifecycleCaller(event, 'export', { ...q, requestId });
         if (!caller)
             return { status: 'rejected', records: [] };
         if (busy || lifecycleBusy || closing || closed)
             return { status: 'unavailable', records: [] };
-        lifecycleBusy = true;
+        beginLifecycle();
         try {
             const approval = await approve('export', caller, requestId, q);
             if (approval.status !== 'approved')
@@ -325,31 +335,52 @@ export function createLogging(options) {
             if (closed || closing)
                 return { status: 'unavailable', records: [] };
             // Recheck after the external approval; no data is disclosed on a revoked decision.
-            const current = await lifecycleCaller(event, 'export', q.tenantId, q.source);
+            const current = await lifecycleCaller(event, 'export', { ...q, requestId });
             if (!current || current.subjectId !== caller.subjectId || closed || closing)
                 return { status: 'rejected', records: [] };
             expire(time().ms);
             const offset = q.offset ?? 0;
             const records = (await visibleEntries(q)).slice(offset, offset + q.limit).map(x => x.record);
+            if (journal) {
+                if (!journal.recordExportRelease)
+                    return { status: 'unavailable', records: [] };
+                if (closing || closed)
+                    return { status: 'unavailable', records: [] };
+                let outcome;
+                try {
+                    outcome = await journal.recordExportRelease({ tenantId: q.tenantId, source: q.source, requestId, subjectId: caller.subjectId, evidenceRef: approval.evidenceRef, committedAt: time().instant, count: records.length });
+                }
+                catch {
+                    outcome = 'uncertain';
+                }
+                if (outcome === 'conflict')
+                    return { status: 'rejected', records: [] };
+                if (outcome !== 'committed') {
+                    close();
+                    return { status: 'uncertain', records: [] };
+                }
+                if (closing || closed)
+                    return { status: 'unavailable', records: [] };
+            }
             return { status: 'completed-local', requestId, evidenceRef: approval.evidenceRef, records, coverage: store ? 'durable diagnostic projection only; no provider export' : 'process-local only; incomplete; no provider export' };
         }
         catch {
             return { status: 'unavailable', records: [] };
         }
         finally {
-            lifecycleBusy = false;
+            endLifecycle();
         }
     }
     async function changeLocalRecord(event, action, target, requestId) {
         if (!plain(target) || !fields(target, ['tenantId', 'source', 'id']) || !token(target.tenantId) || !token(target.source) || !token(target.id) || !token(requestId))
             return { status: 'rejected' };
         const q = { tenantId: target.tenantId, source: target.source, id: target.id };
-        const caller = await lifecycleCaller(event, action, q.tenantId, q.source);
+        const caller = await lifecycleCaller(event, action, { ...q, requestId });
         if (!caller)
             return { status: 'rejected' };
         if (busy || lifecycleBusy || closing || closed)
             return { status: 'unavailable' };
-        lifecycleBusy = true;
+        beginLifecycle();
         try {
             const approval = await approve(action, caller, requestId, q);
             if (approval.status !== 'approved')
@@ -358,7 +389,7 @@ export function createLogging(options) {
                 return { status: approval.preservation === 'held' ? 'blocked' : 'unavailable' };
             if (closed || closing)
                 return { status: 'unavailable' };
-            const current = await lifecycleCaller(event, action, q.tenantId, q.source);
+            const current = await lifecycleCaller(event, action, { ...q, requestId });
             if (!current || current.subjectId !== caller.subjectId)
                 return { status: 'rejected' };
             if (closed || closing)
@@ -396,7 +427,20 @@ export function createLogging(options) {
             return { status: 'unavailable' };
         }
         finally {
-            lifecycleBusy = false;
+            endLifecycle();
+        }
+    }
+    async function observeExternal(observation) {
+        if (!journal)
+            return true;
+        if (!journal.recordExternalObservation)
+            return false;
+        try {
+            const result = await journal.recordExternalObservation({ ...observation, committedAt: time().instant });
+            return result === 'committed' || result === 'duplicate';
+        }
+        catch {
+            return false;
         }
     }
     async function runProviderLifecycle(event, request) {
@@ -408,10 +452,10 @@ export function createLogging(options) {
         const q = { tenantId: target.tenantId, source: target.source, id: target.id };
         if (!options.providerLifecycle || busy || lifecycleBusy || closing || closed)
             return { status: 'unavailable' };
-        lifecycleBusy = true;
+        beginLifecycle();
         try {
-            const caller = await lifecycleCaller(event, action, q.tenantId, q.source);
-            if (!caller || (await options.decide(caller, 'logging.provider.' + action, q)).allowed !== true)
+            const caller = await lifecycleCaller(event, action, { ...q, requestId, destination });
+            if (!caller || (await options.decide(caller, 'logging.provider.' + action, Object.freeze({ ...q, requestId, destination }))).allowed !== true)
                 return { status: 'rejected' };
             if (destination !== 'local' && !external.has(destination))
                 return { status: 'rejected' };
@@ -420,25 +464,28 @@ export function createLogging(options) {
                 return { status: approval.status === 'blocked' ? 'blocked' : 'unavailable' };
             if ((action === 'erase' || action === 'recover') && approval.preservation !== 'clear')
                 return { status: approval.preservation === 'held' ? 'blocked' : 'unavailable' };
-            const current = await lifecycleCaller(event, action, q.tenantId, q.source);
-            if (!current || current.subjectId !== caller.subjectId || (await options.decide(current, 'logging.provider.' + action, q)).allowed !== true)
+            const current = await lifecycleCaller(event, action, { ...q, requestId, destination });
+            if (!current || current.subjectId !== caller.subjectId || (await options.decide(current, 'logging.provider.' + action, Object.freeze({ ...q, requestId, destination }))).allowed !== true)
                 return { status: 'rejected' };
             if (closed || closing)
                 return { status: 'unavailable' };
-            if (!journal)
+            if (!journal?.recordExternalObservation)
                 return { status: 'unavailable' };
             if (action === 'recover' && await journal.visibility(q) !== 'visible')
                 return { status: 'blocked' };
             if (closed || closing)
                 return { status: 'unavailable' };
             const controller = new AbortController();
+            lifecycleAbort = controller;
             let timer;
             try {
                 const result = await Promise.race([options.providerLifecycle({ action, target: q, destination, requestId, subjectId: caller.subjectId, evidenceRef: approval.evidenceRef }, controller.signal), new Promise(resolve => { timer = setTimeout(() => { controller.abort(); resolve({ status: 'uncertain' }); }, timeout); })]);
-                if (result?.status === 'confirmed' && token(result.evidenceRef))
-                    return { status: 'confirmed', evidenceRef: result.evidenceRef };
-                if (result && ['blocked', 'rejected', 'unavailable', 'uncertain'].includes(result.status))
-                    return result;
+                if (result?.status === 'confirmed' && token(result.evidenceRef)) {
+                    const observed = await observeExternal({ kind: 'provider', tenantId: q.tenantId, source: q.source, recordId: q.id, action, destination, requestId, subjectId: caller.subjectId, evidenceRef: result.evidenceRef });
+                    return observed ? { status: 'confirmed', evidenceRef: result.evidenceRef } : { status: 'uncertain' };
+                }
+                if (result && (result.status === 'blocked' || result.status === 'rejected' || result.status === 'unavailable' || result.status === 'uncertain'))
+                    return { status: result.status };
                 return { status: 'uncertain' };
             }
             catch {
@@ -453,13 +500,13 @@ export function createLogging(options) {
             return { status: 'unavailable' };
         }
         finally {
-            lifecycleBusy = false;
+            endLifecycle();
         }
     }
     async function changePolicy(event, input) {
         if (!plain(input) || !fields(input, ['tenantId', 'source', 'expectedRevision', 'policy', 'requestId']) || !token(input.tenantId) || !token(input.source) || !token(input.expectedRevision) || !token(input.requestId) || !plain(input.policy) || !fields(input.policy, ['revision', 'rules']) || !token(input.policy.revision) || input.policy.revision === input.expectedRevision)
             return { status: 'rejected' };
-        if (!options.commitPolicy || !options.resolvePolicy || busy || lifecycleBusy || closing || closed)
+        if (!options.commitPolicy || !options.resolvePolicy || (journal && !journal.recordExternalObservation) || busy || lifecycleBusy || closing || closed)
             return { status: 'unavailable' };
         const { tenantId, source, expectedRevision, requestId } = input;
         let change;
@@ -469,15 +516,15 @@ export function createLogging(options) {
         catch {
             return { status: 'rejected' };
         }
-        lifecycleBusy = true;
+        beginLifecycle();
         try {
-            const caller = await lifecycleCaller(event, 'policy.change', tenantId, source);
+            const caller = await lifecycleCaller(event, 'policy.change', { tenantId, source, requestId, expectedRevision, revision: change.policy.revision });
             if (!caller)
                 return { status: 'rejected' };
             const approval = await approve('policy.change', caller, requestId, change);
             if (approval.status !== 'approved')
                 return { status: approval.status === 'blocked' ? 'blocked' : 'unavailable' };
-            const current = await lifecycleCaller(event, 'policy.change', tenantId, source);
+            const current = await lifecycleCaller(event, 'policy.change', { tenantId, source, requestId, expectedRevision, revision: change.policy.revision });
             if (!current || current.subjectId !== caller.subjectId)
                 return { status: 'rejected' };
             if ((await policy(tenantId, source))?.revision !== expectedRevision)
@@ -486,10 +533,12 @@ export function createLogging(options) {
                 return { status: 'unavailable' };
             try {
                 const result = await options.commitPolicy(change, current, approval.evidenceRef);
-                if (result?.status === 'committed' && result.revision === change.policy.revision && token(result.evidenceRef))
-                    return result;
-                if (result && ['rejected', 'blocked', 'conflict', 'unavailable', 'uncertain'].includes(result.status))
-                    return result;
+                if (result?.status === 'committed' && result.revision === change.policy.revision && token(result.evidenceRef)) {
+                    const observed = await observeExternal({ kind: 'policy', tenantId, source, requestId, subjectId: caller.subjectId, expectedRevision, revision: result.revision, evidenceRef: result.evidenceRef });
+                    return observed ? { status: 'committed', revision: result.revision, evidenceRef: result.evidenceRef } : { status: 'uncertain' };
+                }
+                if (result && (result.status === 'rejected' || result.status === 'blocked' || result.status === 'conflict' || result.status === 'unavailable' || result.status === 'uncertain'))
+                    return { status: result.status };
                 return { status: 'uncertain' };
             }
             catch {
@@ -500,12 +549,12 @@ export function createLogging(options) {
             return { status: 'unavailable' };
         }
         finally {
-            lifecycleBusy = false;
+            endLifecycle();
         }
     }
     async function readPipelineHealth(event, query) {
         const q = snapshotQuery(query);
-        if (!q || !validQuery(q) || !await authorised(event, 'logging.health.read', q.tenantId, q.source))
+        if (!q || !validQuery(q) || !await authorised(event, 'logging.health.read', q))
             return { status: 'rejected' };
         try {
             expire(time().ms);
@@ -521,7 +570,7 @@ export function createLogging(options) {
     async function relayLifecycle(publish, limit = 20) {
         if (!journal || relayBusy || lifecycleBusy || closing || closed || !bounded(limit, 100))
             return { status: 'unavailable', published: 0 };
-        relayBusy = true;
+        beginRelay();
         let published = 0;
         try {
             const events = await journal.pending(limit);
@@ -531,6 +580,7 @@ export function createLogging(options) {
                 if (closing || closed)
                     return { status: 'unavailable', published };
                 const controller = new AbortController();
+                relayAbort = controller;
                 let timer;
                 try {
                     const result = await Promise.race([Promise.resolve().then(() => publish(event, controller.signal)), new Promise(resolve => { timer = setTimeout(() => { controller.abort(); resolve('uncertain'); }, timeout); })]);
@@ -554,14 +604,14 @@ export function createLogging(options) {
             return { status: 'unavailable', published };
         }
         finally {
-            relayBusy = false;
+            endRelay();
         }
     }
     // Explicit maintenance, restricted to composition root; unknown preservation never deletes.
     async function maintainRetention(limit = 20) {
         if (!store || !options.retentionAuthority || busy || lifecycleBusy || closing || closed || !bounded(limit, 100))
             return { status: 'unavailable', removed: 0, held: 0 };
-        lifecycleBusy = true;
+        beginLifecycle();
         let removed = 0, held = 0;
         try {
             const t = time();
@@ -592,7 +642,7 @@ export function createLogging(options) {
                 }
                 if (closing || closed)
                     return { status: 'unavailable', removed, held };
-                if (await store.expire(target, cutoff) === 'removed')
+                if (await store.expire(target, cutoff, t.instant) === 'removed')
                     removed++;
             }
             if (targets.length < limit)
@@ -603,7 +653,7 @@ export function createLogging(options) {
             return { status: 'uncertain', removed, held };
         }
         finally {
-            lifecycleBusy = false;
+            endLifecycle();
         }
     }
     // Only acknowledged event payloads are eligible; request identities and tombstones are never pruned here.
@@ -611,7 +661,7 @@ export function createLogging(options) {
         const maintenance = journal?.maintenance;
         if (!maintenance || !journalRetention || relayBusy || busy || lifecycleBusy || closing || closed || !bounded(limit, 100))
             return { status: 'unavailable', removed: 0, held: 0 };
-        lifecycleBusy = true;
+        beginLifecycle();
         let removed = 0, held = 0;
         try {
             const t = time();
@@ -644,25 +694,27 @@ export function createLogging(options) {
             return { status: 'uncertain', removed, held };
         }
         finally {
-            lifecycleBusy = false;
+            endLifecycle();
         }
     }
     function close() {
         closing = true;
         closed = true;
         activeAbort?.abort();
+        lifecycleAbort?.abort();
+        relayAbort?.abort();
         rows.length = 0;
         buckets.clear();
     }
     async function shutdown() {
         close();
-        const pending = active;
-        if (!pending)
+        const pending = [active, lifecycleDone, relayDone].filter(p => p !== undefined);
+        if (!pending.length)
             return { status: 'completed' };
         // The host must still bound its caller/policy provider latency.
         let timer;
         try {
-            return await Promise.race([pending.then(() => ({ status: 'completed' })), new Promise(resolve => { timer = setTimeout(() => resolve({ status: 'uncertain' }), timeout); })]);
+            return await Promise.race([Promise.allSettled(pending).then(() => ({ status: 'completed' })), new Promise(resolve => { timer = setTimeout(() => resolve({ status: 'uncertain' }), timeout); })]);
         }
         finally {
             if (timer !== undefined)

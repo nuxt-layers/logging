@@ -116,7 +116,11 @@ export type ExportResult = {
     status: 'blocked' | 'rejected' | 'unavailable' | 'uncertain';
     records: never[];
 };
-export type LifecycleEvent = Readonly<{
+export type LifecycleEvent = Readonly<ExternalObservation & {
+    version: 1;
+    id: string;
+    type: 'logging.external.confirmation.observed';
+}> | Readonly<{
     version: 1;
     id: string;
     type: 'logging.restricted' | 'logging.erased';
@@ -127,7 +131,52 @@ export type LifecycleEvent = Readonly<{
     subjectId: string;
     evidenceRef: string;
     committedAt: string;
+}> | Readonly<{
+    version: 1;
+    id: string;
+    type: 'logging.expired';
+    tenantId: string;
+    source: string;
+    recordId: string;
+    committedAt: string;
+}> | Readonly<{
+    version: 1;
+    id: string;
+    type: 'logging.export.released';
+    tenantId: string;
+    source: string;
+    requestId: string;
+    subjectId: string;
+    evidenceRef: string;
+    committedAt: string;
+    count: number;
 }>;
+export type ExternalObservation = {
+    tenantId: string;
+    source: string;
+    requestId: string;
+    subjectId: string;
+    evidenceRef: string;
+    committedAt: string;
+} & ({
+    kind: 'provider';
+    action: 'erase' | 'restrict' | 'recover';
+    recordId: string;
+    destination: string;
+} | {
+    kind: 'policy';
+    expectedRevision: string;
+    revision: string;
+});
+export type ExportRelease = {
+    tenantId: string;
+    source: string;
+    requestId: string;
+    subjectId: string;
+    evidenceRef: string;
+    committedAt: string;
+    count: number;
+};
 export type LifecycleCommit = {
     action: 'restrict' | 'erase';
     target: LifecycleTarget;
@@ -145,7 +194,7 @@ export type DiagnosticStore = LifecycleJournal & {
     load(tenantId: string, source: string, limit: number): Promise<StoredDiagnostic[]>;
     updateDelivery(target: LifecycleTarget, delivery: DeliveryState[]): Promise<void>;
     expired(before: string, limit: number, after?: LifecycleTarget): Promise<LifecycleTarget[]>;
-    expire(target: LifecycleTarget, before: string): Promise<'removed' | 'absent'>;
+    expire(target: LifecycleTarget, before: string, committedAt: string): Promise<'removed' | 'absent'>;
     retentionRecord(target: LifecycleTarget): Promise<RecordEntry | null>;
 };
 export type PreservationDecision = 'clear' | 'held' | 'unknown';
@@ -162,6 +211,8 @@ export type JournalRetentionAuthority = {
 };
 export type LifecycleJournal = {
     commit(command: LifecycleCommit): Promise<'committed' | 'duplicate' | 'conflict' | 'uncertain'>;
+    recordExternalObservation?(observation: ExternalObservation): Promise<'committed' | 'duplicate' | 'conflict' | 'uncertain'>;
+    recordExportRelease?(release: ExportRelease): Promise<'committed' | 'conflict' | 'uncertain'>;
     visibility(target: LifecycleTarget): Promise<'visible' | 'restricted' | 'erased'>;
     pending(limit: number): Promise<LifecycleEvent[]>;
     acknowledge(eventId: string, acknowledgedAt?: string): Promise<void>;
@@ -196,13 +247,26 @@ export type PolicyChangeResult = {
 } | {
     status: 'rejected' | 'blocked' | 'conflict' | 'unavailable' | 'uncertain';
 };
+export type AccessResource = {
+    tenantId: string;
+    source: string;
+    id?: string;
+    destination?: string;
+    requestId?: string;
+    expectedRevision?: string;
+    revision?: string;
+    from?: string;
+    to?: string;
+    severity?: Severity;
+    code?: string;
+    correlation?: string;
+    limit?: number;
+    offset?: number;
+};
 export type Options<E> = {
     resolveCaller(event: E): Promise<Caller | null>;
     resolveProducer(event: E): Promise<Producer | null>;
-    decide(caller: Caller, action: string, resource: {
-        tenantId: string;
-        source: string;
-    }): Promise<{
+    decide(caller: Caller, action: string, resource: AccessResource): Promise<{
         allowed: boolean;
         reason: string;
     }>;
