@@ -13,3 +13,5 @@ Architecture master rechecked at e9dac240c16891fcbed9669228dac6cd5cde9c3c. Purpo
 Governed acknowledged-event payload pruning implemented with verified acknowledgement time, bounded rotating scan, explicit preservation clearance and conditional deletion. Request identity and marker retirement remain intentionally unsupported.
 
 Qualified provider operation and Configuration compare-and-set policy ports added. Actual provider implementations, atomic external hold/recovery checks and event coverage remain unverified.
+
+Final hardening batch: provider and policy results are explicitly projected to public fields. Shutdown aborts active delivery/provider/relay signals and waits within the configured budget for admitted intake, privileged mutations and relay operations; a timeout reports uncertainty. Host ports that ignore cancellation still require independent bounded execution. Regression tests added; local build and acceptance pending.

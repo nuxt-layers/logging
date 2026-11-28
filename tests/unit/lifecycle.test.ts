@@ -63,3 +63,19 @@ test('approval cannot be transferred to a changed caller',async()=>{
  await service.submit(event,diagnostic)
  assert.equal((await service.exportDiagnostics(event,q,'req')).status,'rejected')
 })
+
+test('policy results disclose only contracted fields',async()=>{
+ const service=setup({approveLifecycle:clear,resolvePolicy:async()=>({revision:'v1',rules:[]}),commitPolicy:async()=>({status:'committed',revision:'v2',evidenceRef:'ref',secret:'not public'})})
+ assert.deepEqual(await service.changePolicy(event,{tenantId:'a',source:'worker',expectedRevision:'v1',requestId:'req',policy:{revision:'v2',rules:[]}}),{status:'committed',revision:'v2',evidenceRef:'ref'})
+})
+test('shutdown waits for in-flight policy mutation or reports uncertainty',async()=>{
+ let release!:()=>void, entered!:()=>void
+ const gate=new Promise<void>(r=>{release=r}), ready=new Promise<void>(r=>{entered=r})
+ const service=setup({timeoutMs:20,approveLifecycle:clear,resolvePolicy:async()=>({revision:'v1',rules:[]}),commitPolicy:async()=>{entered();await gate;return {status:'committed',revision:'v2',evidenceRef:'ref'}}})
+ const pending=service.changePolicy(event,{tenantId:'a',source:'worker',expectedRevision:'v1',requestId:'req',policy:{revision:'v2',rules:[]}})
+ await ready
+ assert.equal((await service.shutdown()).status,'uncertain')
+ release()
+ assert.equal((await pending).status,'committed')
+ assert.equal((await service.shutdown()).status,'completed')
+})
