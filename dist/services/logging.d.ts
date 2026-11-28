@@ -1,0 +1,141 @@
+import type { Options, Delivery, Diagnostic, Receipt, DiagnosticQuery, Policy, LifecycleTarget, LifecycleResult, ExportResult, LifecyclePublisher, ProviderLifecycleRequest, ProviderLifecycleResult, PolicyChange, PolicyChangeResult } from '../contracts/types.ts';
+export declare function createLogging<E>(options: Options<E>): {
+    runProviderLifecycle: (event: E, request: Pick<ProviderLifecycleRequest, "action" | "target" | "destination" | "requestId">) => Promise<ProviderLifecycleResult>;
+    changePolicy: (event: E, input: PolicyChange) => Promise<PolicyChangeResult>;
+    maintainJournal: (limit?: number) => Promise<{
+        status: "unavailable";
+        removed: number;
+        held: number;
+    } | {
+        status: "completed";
+        removed: number;
+        held: number;
+    } | {
+        status: "uncertain";
+        removed: number;
+        held: number;
+    }>;
+    maintainRetention: (limit?: number) => Promise<{
+        status: "unavailable";
+        removed: number;
+        held: number;
+    } | {
+        status: "completed";
+        removed: number;
+        held: number;
+    } | {
+        status: "uncertain";
+        removed: number;
+        held: number;
+    }>;
+    relayLifecycle: (publish: LifecyclePublisher, limit?: number) => Promise<{
+        status: "uncertain" | "unavailable";
+        published: number;
+    } | {
+        status: "completed";
+        published: number;
+    }>;
+    submit: (event: E, input: Diagnostic) => Promise<Receipt>;
+    readDiagnostics: (event: E, query: DiagnosticQuery) => Promise<{
+        status: "rejected";
+        records: never[];
+        coverage?: undefined;
+    } | {
+        status: "completed";
+        records: Readonly<{
+            id: string;
+            tenantId: string;
+            source: string;
+            code: string;
+            severity: import("../contracts/types.ts").Severity;
+            occurrenceTime: string;
+            receiptTime: string;
+            timeQuality: "verified" | "degraded" | "unknown";
+            correlation?: string;
+            attributes: Readonly<Record<string, number | boolean>>;
+            policyRevision: string;
+            purpose: string;
+            category: string;
+            classification: "technical";
+            retentionMs?: number;
+        }>[];
+        coverage: string;
+    } | {
+        status: "unavailable";
+        records: never[];
+        coverage?: undefined;
+    }>;
+    readDeliveryState: (event: E, query: DiagnosticQuery) => Promise<{
+        status: "rejected";
+        records: never[];
+        coverage?: undefined;
+    } | {
+        status: "completed";
+        records: {
+            id: string;
+            delivery: {
+                target: string;
+                status: "delivered" | "exhausted" | "uncertain";
+                attempts: number;
+                time: string;
+            }[];
+        }[];
+        coverage: string;
+    } | {
+        status: "unavailable";
+        records: never[];
+        coverage?: undefined;
+    }>;
+    readEffectivePolicy: (event: E, scope: {
+        tenantId: string;
+        source: string;
+    }) => Promise<{
+        status: "rejected";
+        policy?: undefined;
+    } | {
+        status: "completed";
+        policy: Policy;
+    } | {
+        status: "unavailable";
+        policy?: undefined;
+    }>;
+    readPipelineHealth: (event: E, query: DiagnosticQuery) => Promise<{
+        status: "rejected";
+        records?: undefined;
+        delivered?: undefined;
+        exhausted?: undefined;
+        uncertain?: undefined;
+        coverage?: undefined;
+    } | {
+        status: "completed";
+        records: number;
+        delivered: number;
+        exhausted: number;
+        uncertain: number;
+        coverage: "retained scoped records only; excludes intake losses, restricted and expired records; pagination ignored";
+    } | {
+        status: "unavailable";
+        records?: undefined;
+        delivered?: undefined;
+        exhausted?: undefined;
+        uncertain?: undefined;
+        coverage?: undefined;
+    }>;
+    exportDiagnostics: (event: E, query: DiagnosticQuery, requestId: string) => Promise<ExportResult>;
+    eraseDiagnostic: (event: E, target: LifecycleTarget, requestId: string) => Promise<LifecycleResult>;
+    restrictDiagnostic: (event: E, target: LifecycleTarget, requestId: string) => Promise<LifecycleResult>;
+    hostHealth: () => {
+        state: "degraded" | "unknown" | "busy";
+        lastDelivery: "unknown" | Delivery;
+        drops: number;
+        uncertain: number;
+        buffered: number;
+        quarantined: string[];
+    };
+    close: () => void;
+    shutdown: () => Promise<{
+        status: "uncertain";
+    } | {
+        status: "completed";
+    }>;
+};
