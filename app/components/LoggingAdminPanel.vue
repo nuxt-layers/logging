@@ -13,6 +13,8 @@ const intent=ref('')
 const routes=[['overview','/logging'],['records','/logging/records'],['delivery','/logging/delivery'],['settings','/logging/settings'],['data','/logging/data-management']]
 const operation=computed(()=>({overview:'health',records:'records',detail:'records',delivery:'delivery',settings:'policy',data:'records'}[props.section]))
 const detailId=computed(()=>props.section==='detail'?String(route.params.id??''):recordId.value)
+const outcome=computed(()=>{const r=result.value as {status?:string}|null;return typeof r?.status==='string'&&['completed','completed-local','committed','confirmed','blocked','rejected','unavailable','uncertain','conflict'].includes(r.status)?r.status:'unknown'})
+const health=computed(()=>{const r=result.value as {records?:number;delivered?:number;exhausted?:number;uncertain?:number;withoutDelivery?:number;coverage?:string}|null;return props.section==='overview'&&r&&typeof r.records==='number'?r:null})
 const rows=computed(()=>{const r=result.value as {records?:unknown[]}|null;return Array.isArray(r?.records)?r.records:[]})
 function query(){
  return {tenantId:tenantId.value,source:source.value,from:new Date(from.value).toISOString(),to:new Date(to.value).toISOString(),limit:20,offset:offset.value,...(detailId.value?{id:detailId.value}:{}),...(severity.value?{severity:severity.value}:{}),...(code.value?{code:code.value}:{}),...(correlation.value?{correlation:correlation.value}:{})}
@@ -35,7 +37,7 @@ async function call(op:string=operation.value){
   const response=await $fetch('/api/logging/operation',{method:'POST',headers:{'x-logging-request':'1'},body:{operation:op,input,requestId:requestId.value}})
   if(requestGeneration!==generation)return
   result.value=response
-  notice.value=t('logging.response')
+  notice.value=t('logging.outcome.'+outcome.value)
  } catch {if(requestGeneration===generation)notice.value=t('logging.failed')}
  finally {busy.value=false;confirmed.value=false}
 }
@@ -64,8 +66,11 @@ watch(()=>route.fullPath,()=>{tenantId.value='';source.value='';recordId.value='
   <p role="status" aria-live="polite">{{ busy?t('logging.loading'):notice }}</p>
   <template v-if="result">
    <h2>{{ t('logging.result') }}</h2>
+   <p>{{ t('logging.outcome.'+outcome) }}</p>
+   <dl v-if="health"><template v-for="key in (['records','delivered','exhausted','uncertain','withoutDelivery'] as const)" :key="key"><dt>{{ t('logging.health.'+key) }}</dt><dd>{{ health[key] }}</dd></template></dl>
+   <p v-if="health">{{ t('logging.health.coverage') }}: {{ health.coverage }}</p>
    <ul v-if="section==='records'&&rows.length"><li v-for="row in rows" :key="(row as any).id"><NuxtLink class="text-pen-link-default hover:bg-fill-link-hover hover:text-pen-link-hover focus-visible:outline-focus focus-visible:outline-edge-link-focus" :to="'/logging/records/'+encodeURIComponent((row as any).id)">{{ (row as any).code }} — {{ (row as any).id }}</NuxtLink></li></ul>
-   <pre tabindex="0" class="border border-edge-base-default bg-fill-base-default text-pen-base-default focus-visible:outline-focus focus-visible:outline-edge-base-focus">{{ JSON.stringify(result,null,2) }}</pre>
+   <details><summary>{{ t('logging.technicalDetails') }}</summary><pre tabindex="0" class="border border-edge-base-default bg-fill-base-default text-pen-base-default focus-visible:outline-focus focus-visible:outline-edge-base-focus">{{ JSON.stringify(result,null,2) }}</pre></details>
    <div v-if="section==='records'||section==='delivery'">
     <button class="rounded-control border border-edge-primary-default bg-fill-primary-default text-pen-primary-default hover:bg-fill-primary-hover hover:text-pen-primary-hover hover:border-edge-primary-hover focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-primary-focus disabled:bg-fill-primary-disabled disabled:text-pen-primary-disabled disabled:border-edge-primary-disabled" :disabled="busy||offset===0" @click="offset=Math.max(0,offset-20);call()">{{ t('logging.previous') }}</button>
     <button class="rounded-control border border-edge-primary-default bg-fill-primary-default text-pen-primary-default hover:bg-fill-primary-hover hover:text-pen-primary-hover hover:border-edge-primary-hover focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-primary-focus disabled:bg-fill-primary-disabled disabled:text-pen-primary-disabled disabled:border-edge-primary-disabled" :disabled="busy||rows.length<20" @click="offset+=20;call()">{{ t('logging.next') }}</button>

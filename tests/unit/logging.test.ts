@@ -129,3 +129,21 @@ test('scoped retained severity distribution and clock-derived delivery time',asy
  assert.equal((await service.readDeliveryState(event,q)).records[0]?.delivery[0]?.time,stamp)
  assert.equal((await service.readPipelineHealth({...event,tenantId:'b'},q)).status,'rejected')
 })
+
+test('scope intake counters require independent permission and exclude other tenants',async()=>{
+ const service=setup({ratePerMinute:1})
+ await service.submit(event,diagnostic)
+ await service.submit(event,diagnostic)
+ await service.submit({...event,tenantId:'b'},diagnostic)
+ const q={tenantId:'a',source:'worker',from:stamp,to:stamp,limit:10}
+ const result=await service.readPipelineHealth(event,q)
+ assert.equal(result.status,'completed')
+ if(result.status==='completed'){
+  assert.deepEqual(result.scopeIntake,{accepted:1,rejected:0,throttled:1,unavailable:0,uncertain:0})
+  assert.equal(result.destinations[0]?.state,'ready')
+ }
+ const denied=setup({decide:async(_c,action)=>({allowed:action!=='logging.health.scope.read',reason:'test'})})
+ await denied.submit(event,diagnostic)
+ const restricted=await denied.readPipelineHealth(event,q)
+ if(restricted.status==='completed')assert.equal(restricted.scopeIntake,null)
+})

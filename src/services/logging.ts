@@ -34,6 +34,19 @@ export function createLogging<E>(options: Options<E>) {
   }
   let retentionCursor:LifecycleTarget|undefined
   const rows: {record:RecordEntry;delivery:DeliveryState[];restricted:boolean}[] = []
+  // Bounded process-lifetime scope counters; never attribute unauthenticated or busy intake.
+  const scopedIntake=new Map<string,{accepted:number;rejected:number;throttled:number;unavailable:number;uncertain:number}>()
+  let scopeCoverageLimited=false
+  function countScoped(key:string,receipt:Receipt):Receipt {
+    let counts=scopedIntake.get(key)
+    if(!counts){
+      if(scopedIntake.size>=capacity){scopeCoverageLimited=true;return receipt}
+      counts={accepted:0,rejected:0,throttled:0,unavailable:0,uncertain:0}
+      scopedIntake.set(key,counts)
+    }
+    counts[receipt.status]=Math.min(Number.MAX_SAFE_INTEGER,counts[receipt.status]+1)
+    return receipt
+  }
   const buckets = new Map<string,{count:number;minute:number}>()
   // Uncertain external sinks remain quarantined until recomposition, so ignored aborts cannot accumulate.
   const quarantined = new Set<string>()
@@ -90,10 +103,11 @@ export function createLogging<E>(options: Options<E>) {
     }catch{}
     sinkObservationFailures=Math.min(Number.MAX_SAFE_INTEGER,sinkObservationFailures+1)
   }
-  async function perform(event:E,input:Diagnostic):Promise<Receipt> {
+  async function perform(event:E,input:Diagnostic,scope:(key:string)=>void):Promise<Receipt> {
     try {
       const producer=await options.resolveProducer(event)
       if(!producer || !token(producer.tenantId) || !token(producer.source) || (await options.decide(producer,'logging.submit',{tenantId:producer.tenantId,source:producer.source})).allowed!==true) return {status:'rejected',code:'LOG_DENIED'}
+      scope(JSON.stringify([producer.tenantId,producer.source]))
       const p=await policy(producer.tenantId,producer.source)
       if(!p) return {status:'unavailable',code:'LOG_POLICY_UNAVAILABLE'}
       const code=diagnosticCode(input)
@@ -158,7 +172,8 @@ export function createLogging<E>(options: Options<E>) {
   function submit(event:E,input:Diagnostic):Promise<Receipt> {
     if(closed||closing||busy||lifecycleBusy) {drops++;return Promise.resolve(countReceipt({status:'unavailable',code:'LOG_BUSY'}))}
     busy=true;activeSince=performance.now()
-    const task=perform(event,input).then(countReceipt).finally(()=>{busy=false;active=undefined;activeSince=null})
+    let scopeKey:string|undefined
+    const task=perform(event,input,key=>{scopeKey=key}).then(receipt=>countReceipt(scopeKey===undefined?receipt:countScoped(scopeKey,receipt))).finally(()=>{busy=false;active=undefined;activeSince=null})
     active=task
     return task
   }
@@ -414,8 +429,17 @@ export function createLogging<E>(options: Options<E>) {
       const withoutDelivery=entries.filter(x=>x.delivery.length===0).length
       const severityDistribution={debug:0,info:0,warn:0,error:0,fatal:0}
       for(const entry of entries)severityDistribution[entry.record.severity]++
+      const destinations=[...new Set(delivery.map(d=>d.target))].sort().map(target=>{
+        const states=delivery.filter(d=>d.target===target)
+        const last=states.reduce((a,b)=>Date.parse(b.time)>=Date.parse(a.time)?b:a)
+        return {target,state:last.status==='delivered'?'ready' as const:'degraded' as const,observedAt:last.time,exhausted:states.filter(d=>d.status==='exhausted').length,uncertain:states.filter(d=>d.status==='uncertain').length}
+      })
+      // Scope-wide counters must not bypass a resource-filtered read permission.
+      const scopeOnly={tenantId:q.tenantId,source:q.source}
+      const canReadScope=await authorised(event,'logging.health.scope.read',scopeOnly)
       await checkRead(event,'logging.health.read',q,generation)
-      return {status:'completed' as const,observedAt:observed.instant,timeQuality:observed.quality,storage:store?'durable' as const:'process-local' as const,withoutDelivery,severityDistribution,records:entries.length,delivered:delivery.filter(x=>x.status==='delivered').length,exhausted:delivery.filter(x=>x.status==='exhausted').length,uncertain:delivery.filter(x=>x.status==='uncertain').length,coverage:'retained scoped records only; excludes intake losses, restricted and expired records; pagination ignored' as const}
+      const scoped=canReadScope?scopedIntake.get(JSON.stringify([q.tenantId,q.source])):undefined
+      return {status:'completed' as const,observedAt:observed.instant,timeQuality:observed.quality,storage:store?'durable' as const:'process-local' as const,withoutDelivery,severityDistribution,destinations,scopeIntake:scoped?{...scoped}:null,scopeIntakeCoverage:canReadScope?(scopeCoverageLimited?'bounded-process-lifetime; some scopes omitted':'process-lifetime; excludes unauthorised and busy intake'):'not-authorised',records:entries.length,delivered:delivery.filter(x=>x.status==='delivered').length,exhausted:delivery.filter(x=>x.status==='exhausted').length,uncertain:delivery.filter(x=>x.status==='uncertain').length,coverage:'retained scoped records only; excludes intake losses, restricted and expired records; pagination ignored' as const}
     } catch {return {status:'unavailable' as const}}
   }
   // Deployment-wide durable metadata is deliberately not exposed through tenant HTTP queries.

@@ -5,3 +5,5 @@ Six routes, one scoped administration panel, host i18n messages and explicit pre
 Theme Manager public CONTRACT.md at 1333f2e supplies semantic utilities and default stylesheet. Logging consumes semantic roles/states only; host includes exported component in Tailwind discovery. No private provider or theme state imported. Production Theme Manager composition remains blocked by its own contract. Scope changes invalidate outstanding browser results.
 
 Completion candidate adds severity/code/correlation filters, monotonic request-generation invalidation and explicit operation selection before confirmation. Any input change invalidates confirmation; route changes clear scope. Browser date input still uses local time conversion, not a verified Clock composition. Earlier independent fixture passed 20 browser checks, not current candidate acceptance or complete WCAG certification.
+
+The overview presents labelled retained-record counts, explicit qualified result states and optional technical details. All added labels are host i18n messages. Scope-wide intake requires a distinct server permission; its counters are not period-specific or durable.
