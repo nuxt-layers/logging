@@ -391,7 +391,7 @@ export function createLogging<E>(options: Options<E>) {
         const decision=await options.retentionAuthority.resolvePreservation(target)
         if(decision!=='clear'){held++;continue}
         if(closing||closed)return {status:'unavailable' as const,removed,held}
-        if(await store.expire(target,cutoff)==='removed')removed++
+        if(await store.expire(target,cutoff,t.instant)==='removed')removed++
       }
       if(targets.length<limit)retentionCursor=undefined
       return {status:'completed' as const,removed,held}

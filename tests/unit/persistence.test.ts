@@ -35,6 +35,12 @@ test('persistent diagnostic recovery, restriction and hold-aware expiry',async()
   preservation='clear'
   assert.equal((await service.maintainRetention()).removed,1)
   assert.equal(await store.visibility(target),'restricted')
+  const events=await store.pending(10)
+  assert.deepEqual(events.map(e=>e.type),['logging.restricted','logging.expired'])
+  assert.equal(events[1]?.recordId,target.id)
+  assert.equal(events[1]?.committedAt,now)
+  assert.equal((await service.maintainRetention()).removed,0)
+  assert.equal((await store.pending(10)).length,2)
   service.close()
  } finally {store.close();rmSync(dir,{recursive:true,force:true})}
 })

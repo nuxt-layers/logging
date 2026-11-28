@@ -48,3 +48,24 @@ test('maintenance removes only aged acknowledged events, retaining replay identi
   assert.equal((await journal.pending(10))[0]?.id,pending.id)
  } finally {journal.close();rmSync(dir,{recursive:true,force:true})}
 })
+
+test('expiry commits its event once and survives reopening',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'logging-expiry-'))
+ const path=join(dir,'journal.sqlite')
+ let journal=createSqliteLifecycleJournal(path)
+ const stamp=command.committedAt
+ const record={id:'record',tenantId:'a',source:'worker',code:'worker.done',severity:'info' as const,occurrenceTime:stamp,receiptTime:stamp,timeQuality:'verified' as const,attributes:{},policyRevision:'v1',purpose:'diagnostics',category:'technical',classification:'technical' as const}
+ try {
+  assert.equal(await journal.save({record,delivery:[]},10),'stored')
+  assert.equal(await journal.expire(command.target,'2026-11-25T00:00:00Z',stamp),'absent')
+  assert.equal((await journal.pending(10)).length,0)
+  assert.equal(await journal.expire(command.target,stamp,stamp),'removed')
+  journal.close();journal=createSqliteLifecycleJournal(path)
+  assert.equal((await journal.load('a','worker',10)).length,0)
+  assert.equal(await journal.expire(command.target,stamp,stamp),'absent')
+  const events=await journal.pending(10)
+  assert.equal(events.length,1)
+  assert.equal(events[0]?.type,'logging.expired')
+  assert.equal(events[0]?.recordId,'record')
+ } finally {journal.close();rmSync(dir,{recursive:true,force:true})}
+})

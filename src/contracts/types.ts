@@ -32,6 +32,8 @@ export type ExportResult =
 export type LifecycleEvent = Readonly<{
   version:1; id:string; type:'logging.restricted'|'logging.erased'; tenantId:string; source:string;
   recordId:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string
+}> | Readonly<{
+  version:1; id:string; type:'logging.expired'; tenantId:string; source:string; recordId:string; committedAt:string
 }>
 export type LifecycleCommit = {
   action:'restrict'|'erase'; target:LifecycleTarget; requestId:string; subjectId:string;
@@ -43,7 +45,7 @@ export type DiagnosticStore = LifecycleJournal & {
   load(tenantId:string,source:string,limit:number):Promise<StoredDiagnostic[]>
   updateDelivery(target:LifecycleTarget,delivery:DeliveryState[]):Promise<void>
   expired(before:string,limit:number,after?:LifecycleTarget):Promise<LifecycleTarget[]>
-  expire(target:LifecycleTarget,before:string):Promise<'removed'|'absent'>
+  expire(target:LifecycleTarget,before:string,committedAt:string):Promise<'removed'|'absent'>
   retentionRecord(target:LifecycleTarget):Promise<RecordEntry|null>
 }
 export type PreservationDecision = 'clear'|'held'|'unknown'

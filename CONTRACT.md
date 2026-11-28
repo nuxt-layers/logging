@@ -102,6 +102,8 @@ export type ExportResult =
 export type LifecycleEvent = Readonly<{
   version:1; id:string; type:'logging.restricted'|'logging.erased'; tenantId:string; source:string;
   recordId:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string
+}> | Readonly<{
+  version:1; id:string; type:'logging.expired'; tenantId:string; source:string; recordId:string; committedAt:string
 }>
 export type LifecycleCommit = {
   action:'restrict'|'erase'; target:LifecycleTarget; requestId:string; subjectId:string;
@@ -113,7 +115,7 @@ export type DiagnosticStore = LifecycleJournal & {
   load(tenantId:string,source:string,limit:number):Promise<StoredDiagnostic[]>
   updateDelivery(target:LifecycleTarget,delivery:DeliveryState[]):Promise<void>
   expired(before:string,limit:number,after?:LifecycleTarget):Promise<LifecycleTarget[]>
-  expire(target:LifecycleTarget,before:string):Promise<'removed'|'absent'>
+  expire(target:LifecycleTarget,before:string,committedAt:string):Promise<'removed'|'absent'>
   retentionRecord(target:LifecycleTarget):Promise<RecordEntry|null>
 }
 export type PreservationDecision = 'clear'|'held'|'unknown'
@@ -354,6 +356,8 @@ In one host Nitro plugin, import provideLogging, getLogging and closeLogging fro
 POST /api/logging/operation accepts JSON {operation,input,requestId?}; requires exact configured Origin, application/json, x-logging-request: 1, bounded Content-Length (1–32768 bytes), no chunked body. Host ingress must enforce matching body and request-rate limits and same-origin session/CSRF rules. Operations records/delivery/health/policy/export/erase/restrict/provider/policy.change map exactly to the documented service calls. All use trusted server-side caller resolution and separate permissions; no browser submit or composition-root operation. Malformed requests return safe HTTP errors; service outcomes are returned as typed results, not translated into success claims. Disabled/uncomposed service fails closed. No cache or referrer; host must enforce CSP frame-ancestors and TLS. Browser data is transient and cleared on scope edit; no browser storage or download persistence added.
 
 ## Headless surface
+
+Durable retention expiry emits `logging.expired` atomically with removal; the maintenance event has no fabricated operator or approval evidence. The store must implement this atomic guarantee. Process-local expiry is not a durable event. External authority commits are not claimed as local atomic commits.
 
 Implemented: validated diagnostic admission, sanitised sink output, scoped reads, delivery projection, effective policy projection, scoped retained-record health, protected local export/restriction/erasure, host health and shutdown. These work without a GUI, Nuxt or external destinations. No mandatory database.
 

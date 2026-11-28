@@ -74,9 +74,17 @@ export function createSqliteLifecycleJournal(path) {
       const row=db.prepare('SELECT payload FROM logging_diagnostics WHERE tenant=? AND source=? AND record=?').get(target.tenantId,target.source,target.id)
       return row?JSON.parse(row.payload):null
     },
-    async expire(target,before) {
-      const result=db.prepare('DELETE FROM logging_diagnostics WHERE tenant=? AND source=? AND record=? AND receipt<=?').run(target.tenantId,target.source,target.id,Date.parse(before))
-      return result.changes?'removed':'absent'
+    async expire(target,before,committedAt) {
+      if(!Number.isFinite(Date.parse(before))||!Number.isFinite(Date.parse(committedAt)))throw new Error('LOG_INVALID_LIMIT')
+      try {
+        db.exec('BEGIN IMMEDIATE')
+        const result=db.prepare('DELETE FROM logging_diagnostics WHERE tenant=? AND source=? AND record=? AND receipt<=?').run(target.tenantId,target.source,target.id,Date.parse(before))
+        if(!result.changes){db.exec('ROLLBACK');return 'absent'}
+        const event={version:1,id:randomUUID(),type:'logging.expired',tenantId:target.tenantId,source:target.source,recordId:target.id,committedAt}
+        insertEvent.run(event.id,JSON.stringify(event))
+        db.exec('COMMIT')
+        return 'removed'
+      } catch(error){try{db.exec('ROLLBACK')}catch{}throw error}
     },
     async commit(command) {
       const {action,target,requestId,subjectId,evidenceRef,committedAt}=command
