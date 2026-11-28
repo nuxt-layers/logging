@@ -7,36 +7,41 @@ const tenantId=ref(''), source=ref(''), from=ref(''), to=ref(''), recordId=ref('
 const offset=ref(0), busy=ref(false), result=ref<unknown>(null), notice=ref('')
 const requestId=ref(''), destination=ref(''), action=ref('restrict'), policy=ref('')
 const confirmed=ref(false)
+const severity=ref(''), code=ref(''), correlation=ref('')
+let generation=0
+const intent=ref('')
 const routes=[['overview','/logging'],['records','/logging/records'],['delivery','/logging/delivery'],['settings','/logging/settings'],['data','/logging/data-management']]
 const operation=computed(()=>({overview:'health',records:'records',detail:'records',delivery:'delivery',settings:'policy',data:'records'}[props.section]))
 const detailId=computed(()=>props.section==='detail'?String(route.params.id??''):recordId.value)
 const rows=computed(()=>{const r=result.value as {records?:unknown[]}|null;return Array.isArray(r?.records)?r.records:[]})
 function query(){
- return {tenantId:tenantId.value,source:source.value,from:new Date(from.value).toISOString(),to:new Date(to.value).toISOString(),limit:20,offset:offset.value,...(detailId.value?{id:detailId.value}:{})}
+ return {tenantId:tenantId.value,source:source.value,from:new Date(from.value).toISOString(),to:new Date(to.value).toISOString(),limit:20,offset:offset.value,...(detailId.value?{id:detailId.value}:{}),...(severity.value?{severity:severity.value}:{}),...(code.value?{code:code.value}:{}),...(correlation.value?{correlation:correlation.value}:{})}
 }
 async function call(op:string=operation.value){
  if(busy.value)return
+ const requestGeneration=++generation
  result.value=null;notice.value='';busy.value=true
  try {
   const target={tenantId:tenantId.value,source:source.value,id:detailId.value}
   const mutating=['erase','restrict','provider','policy.change','export'].includes(op)
-  if(mutating&&!confirmed.value){notice.value=t('logging.confirmRequired');return}
+  if(mutating&&(!confirmed.value||intent.value!==op)){notice.value=t('logging.confirmRequired');return}
   let input:unknown
   if(op==='policy')input={tenantId:tenantId.value,source:source.value}
   else if(op==='erase'||op==='restrict')input=target
   else if(op==='provider')input={action:action.value,target,destination:destination.value,requestId:requestId.value}
   else if(op==='policy.change')input={...JSON.parse(policy.value),tenantId:tenantId.value,source:source.value,requestId:requestId.value}
   else input=query()
-  const scopeAtRequest=JSON.stringify([tenantId.value,source.value,from.value,to.value,detailId.value,route.fullPath])
+  confirmed.value=false
   const response=await $fetch('/api/logging/operation',{method:'POST',headers:{'x-logging-request':'1'},body:{operation:op,input,requestId:requestId.value}})
-  if(scopeAtRequest!==JSON.stringify([tenantId.value,source.value,from.value,to.value,detailId.value,route.fullPath]))return
+  if(requestGeneration!==generation)return
   result.value=response
   notice.value=t('logging.response')
- } catch {notice.value=t('logging.failed')}
+ } catch {if(requestGeneration===generation)notice.value=t('logging.failed')}
  finally {busy.value=false;confirmed.value=false}
 }
-function clear(){result.value=null;notice.value='';offset.value=0;confirmed.value=false}
-watch(()=>route.fullPath,clear)
+function clear(){generation++;result.value=null;notice.value='';offset.value=0;confirmed.value=false}
+watch([tenantId,source,from,to,detailId,severity,code,correlation,requestId,destination,action,policy,intent,()=>route.fullPath],clear,{flush:'sync'})
+watch(()=>route.fullPath,()=>{tenantId.value='';source.value='';recordId.value='';requestId.value='';destination.value='';policy.value='';intent.value=''},{flush:'sync'})
 </script>
 
 <template>
@@ -50,6 +55,9 @@ watch(()=>route.fullPath,clear)
     <label>{{ t('logging.from') }}<input class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="from" required type="datetime-local" @input="clear"></label>
     <label>{{ t('logging.to') }}<input class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="to" required type="datetime-local" @input="clear"></label>
     <label v-if="section==='data'">{{ t('logging.recordId') }}<input class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="recordId" maxlength="96" @input="clear"></label>
+    <label v-if="section!=='detail'">{{ t('logging.severity') }}<select class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="severity"><option value="">{{ t('logging.allSeverities') }}</option><option v-for="level in ['debug','info','warn','error','fatal']" :key="level" :value="level">{{ t('logging.severity.'+level) }}</option></select></label>
+    <label v-if="section!=='detail'">{{ t('logging.code') }}<input class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="code" maxlength="96"></label>
+    <label v-if="section!=='detail'">{{ t('logging.correlation') }}<input class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="correlation" maxlength="96"></label>
    </template>
    <button class="rounded-control border border-edge-primary-default bg-fill-primary-default text-pen-primary-default hover:bg-fill-primary-hover hover:text-pen-primary-hover hover:border-edge-primary-hover focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-primary-focus disabled:bg-fill-primary-disabled disabled:text-pen-primary-disabled disabled:border-edge-primary-disabled" type="submit" :disabled="busy">{{ t('logging.load') }}</button>
   </form>
@@ -66,18 +74,19 @@ watch(()=>route.fullPath,clear)
   <fieldset class="border border-edge-base-default p-step-sm" v-if="section==='settings'||section==='data'">
    <legend>{{ t('logging.protected') }}</legend>
    <label>{{ t('logging.requestId') }}<input class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="requestId" maxlength="96"></label>
+   <label>{{ t('logging.intent') }}<select class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="intent"><option value="">{{ t('logging.chooseOperation') }}</option><option v-if="section==='settings'" value="policy.change">{{ t('logging.changePolicy') }}</option><template v-else><option v-for="op in ['export','restrict','erase','provider']" :key="op" :value="op">{{ t('logging.'+op) }}</option></template></select></label>
    <label><input class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="confirmed" type="checkbox">{{ t('logging.confirm') }}</label>
    <template v-if="section==='settings'">
     <label>{{ t('logging.policyJson') }}<textarea class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="policy" rows="6" maxlength="16000"/></label>
-    <button class="rounded-control border border-edge-primary-default bg-fill-primary-default text-pen-primary-default hover:bg-fill-primary-hover hover:text-pen-primary-hover hover:border-edge-primary-hover focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-primary-focus disabled:bg-fill-primary-disabled disabled:text-pen-primary-disabled disabled:border-edge-primary-disabled" :disabled="busy||!confirmed||!requestId" @click="call('policy.change')">{{ t('logging.changePolicy') }}</button>
+    <button class="rounded-control border border-edge-primary-default bg-fill-primary-default text-pen-primary-default hover:bg-fill-primary-hover hover:text-pen-primary-hover hover:border-edge-primary-hover focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-primary-focus disabled:bg-fill-primary-disabled disabled:text-pen-primary-disabled disabled:border-edge-primary-disabled" :disabled="busy||!confirmed||!requestId||intent!=='policy.change'" @click="call('policy.change')">{{ t('logging.changePolicy') }}</button>
    </template>
    <template v-else>
-    <button class="rounded-control border border-edge-primary-default bg-fill-primary-default text-pen-primary-default hover:bg-fill-primary-hover hover:text-pen-primary-hover hover:border-edge-primary-hover focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-primary-focus disabled:bg-fill-primary-disabled disabled:text-pen-primary-disabled disabled:border-edge-primary-disabled" :disabled="busy||!confirmed||!requestId" @click="call('export')">{{ t('logging.export') }}</button>
-    <button class="rounded-control border border-edge-primary-default bg-fill-primary-default text-pen-primary-default hover:bg-fill-primary-hover hover:text-pen-primary-hover hover:border-edge-primary-hover focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-primary-focus disabled:bg-fill-primary-disabled disabled:text-pen-primary-disabled disabled:border-edge-primary-disabled" :disabled="busy||!confirmed||!requestId||!recordId" @click="call('restrict')">{{ t('logging.restrict') }}</button>
-    <button class="rounded-control border border-edge-primary-default bg-fill-primary-default text-pen-primary-default hover:bg-fill-primary-hover hover:text-pen-primary-hover hover:border-edge-primary-hover focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-primary-focus disabled:bg-fill-primary-disabled disabled:text-pen-primary-disabled disabled:border-edge-primary-disabled" :disabled="busy||!confirmed||!requestId||!recordId" @click="call('erase')">{{ t('logging.erase') }}</button>
+    <button class="rounded-control border border-edge-primary-default bg-fill-primary-default text-pen-primary-default hover:bg-fill-primary-hover hover:text-pen-primary-hover hover:border-edge-primary-hover focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-primary-focus disabled:bg-fill-primary-disabled disabled:text-pen-primary-disabled disabled:border-edge-primary-disabled" :disabled="busy||!confirmed||!requestId||intent!=='export'" @click="call('export')">{{ t('logging.export') }}</button>
+    <button class="rounded-control border border-edge-primary-default bg-fill-primary-default text-pen-primary-default hover:bg-fill-primary-hover hover:text-pen-primary-hover hover:border-edge-primary-hover focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-primary-focus disabled:bg-fill-primary-disabled disabled:text-pen-primary-disabled disabled:border-edge-primary-disabled" :disabled="busy||!confirmed||!requestId||!recordId||intent!=='restrict'" @click="call('restrict')">{{ t('logging.restrict') }}</button>
+    <button class="rounded-control border border-edge-primary-default bg-fill-primary-default text-pen-primary-default hover:bg-fill-primary-hover hover:text-pen-primary-hover hover:border-edge-primary-hover focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-primary-focus disabled:bg-fill-primary-disabled disabled:text-pen-primary-disabled disabled:border-edge-primary-disabled" :disabled="busy||!confirmed||!requestId||!recordId||intent!=='erase'" @click="call('erase')">{{ t('logging.erase') }}</button>
     <label>{{ t('logging.destination') }}<input class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="destination" maxlength="96"></label>
     <label>{{ t('logging.action') }}<select class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="action"><option value="restrict">{{t('logging.restrict')}}</option><option value="erase">{{t('logging.erase')}}</option><option value="recover">{{t('logging.recover')}}</option></select></label>
-    <button class="rounded-control border border-edge-primary-default bg-fill-primary-default text-pen-primary-default hover:bg-fill-primary-hover hover:text-pen-primary-hover hover:border-edge-primary-hover focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-primary-focus disabled:bg-fill-primary-disabled disabled:text-pen-primary-disabled disabled:border-edge-primary-disabled" :disabled="busy||!confirmed||!requestId||!recordId||!destination" @click="call('provider')">{{t('logging.provider')}}</button>
+    <button class="rounded-control border border-edge-primary-default bg-fill-primary-default text-pen-primary-default hover:bg-fill-primary-hover hover:text-pen-primary-hover hover:border-edge-primary-hover focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-primary-focus disabled:bg-fill-primary-disabled disabled:text-pen-primary-disabled disabled:border-edge-primary-disabled" :disabled="busy||!confirmed||!requestId||!recordId||!destination||intent!=='provider'" @click="call('provider')">{{t('logging.provider')}}</button>
    </template>
   </fieldset>
  </section>
