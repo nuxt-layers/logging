@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto'
 
 // Host owns file path, filesystem permissions, backups, retention and lifecycle.
 // One Logging-owned database per deployment, not a shared application table.
-export function createSqliteLifecycleJournal(path) {
+export function createSqliteLifecycleJournal(path, capacity = 100000) {
+  if (!Number.isSafeInteger(capacity) || capacity < 1 || capacity > 1000000) throw new Error('LOG_JOURNAL_CAPACITY')
   if (typeof path !== 'string' || !path || path === ':memory:') throw new Error('LOG_DURABLE_PATH')
   const db = new DatabaseSync(path)
   try {
@@ -43,7 +44,34 @@ export function createSqliteLifecycleJournal(path) {
   const insertEvent = db.prepare('INSERT INTO logging_outbox(id,payload) VALUES(?,?)')
   const pending = db.prepare('SELECT payload FROM logging_outbox WHERE acknowledged=0 ORDER BY seq LIMIT ?')
   const acknowledge = db.prepare('UPDATE logging_outbox SET acknowledged=1, acknowledged_at=? WHERE id=? AND acknowledged=0')
+  const requestCount=db.prepare('SELECT COUNT(*) AS n FROM logging_requests')
+  const markerCount=db.prepare('SELECT COUNT(*) AS n FROM logging_lifecycle')
+  const eventCount=db.prepare('SELECT COUNT(*) AS n FROM logging_outbox')
+  const reservations=db.prepare("SELECT COUNT(*) AS n FROM logging_requests WHERE substr(fingerprint,1,20)='[\"external-pending\",'")
+  const pendingCount=db.prepare('SELECT COUNT(*) AS n FROM logging_outbox WHERE acknowledged=0')
+  const oldestPending=db.prepare("SELECT json_extract(payload,'$.committedAt') AS stamp FROM logging_outbox WHERE acknowledged=0 ORDER BY seq LIMIT 1")
+  const eventFull=()=>eventCount.get().n+reservations.get().n>=capacity
+  const requestFull=()=>requestCount.get().n>=capacity
+  const detailOf=x=>x.kind==='provider'?{kind:'provider',action:x.action,recordId:x.recordId,destination:x.destination}:x.kind==='policy'?{kind:'policy',expectedRevision:x.expectedRevision,revision:x.revision}:null
+  const reservation=(subjectId,detail)=>JSON.stringify(['external-pending',subjectId,detail])
   return {
+    async health() {
+      return {capacity,requests:requestCount.get().n,markers:markerCount.get().n,events:eventCount.get().n,reservations:reservations.get().n,pending:pendingCount.get().n,oldestPendingAt:oldestPending.get()?.stamp??null}
+    },
+    async reserveExternal(intent) {
+      const {tenantId,source,requestId,subjectId}=intent
+      const detail=detailOf(intent)
+      if(!detail)return 'conflict'
+      const fingerprint=reservation(subjectId,detail)
+      try {
+        db.exec('BEGIN IMMEDIATE')
+        const previous=lookup.get(tenantId,source,requestId)
+        if(previous){db.exec('ROLLBACK');return previous.fingerprint===fingerprint?'uncertain':'conflict'}
+        if(requestFull()||eventFull()){db.exec('ROLLBACK');return 'full'}
+        insertRequest.run(tenantId,source,requestId,fingerprint)
+        db.exec('COMMIT');return 'reserved'
+      } catch {try{db.exec('ROLLBACK')}catch{}return 'uncertain'}
+    },
     async save(entry,capacity) {
       if(!Number.isSafeInteger(capacity)||capacity<1||capacity>10000)return 'uncertain'
       const r=entry.record
@@ -78,6 +106,7 @@ export function createSqliteLifecycleJournal(path) {
       if(!Number.isFinite(Date.parse(before))||!Number.isFinite(Date.parse(committedAt)))throw new Error('LOG_INVALID_LIMIT')
       try {
         db.exec('BEGIN IMMEDIATE')
+        if(eventFull())throw new Error('LOG_JOURNAL_CAPACITY')
         const result=db.prepare('DELETE FROM logging_diagnostics WHERE tenant=? AND source=? AND record=? AND receipt<=?').run(target.tenantId,target.source,target.id,Date.parse(before))
         if(!result.changes){db.exec('ROLLBACK');return 'absent'}
         const event={version:1,id:randomUUID(),type:'logging.expired',tenantId:target.tenantId,source:target.source,recordId:target.id,committedAt}
@@ -102,6 +131,7 @@ export function createSqliteLifecycleJournal(path) {
           db.exec('ROLLBACK')
           return 'conflict'
         }
+        if(requestFull()||eventFull()||(!state.get(tenantId,source,id)&&markerCount.get().n>=capacity)){db.exec('ROLLBACK');return 'full'}
         const event={version:1,id:randomUUID(),type:action==='erase'?'logging.erased':'logging.restricted',tenantId,source,recordId:id,requestId,subjectId,evidenceRef,committedAt}
         mutate.run(tenantId,source,id,action==='erase'?'erased':'restricted')
         if(action==='erase')db.prepare('DELETE FROM logging_diagnostics WHERE tenant=? AND source=? AND record=?').run(tenantId,source,id)
@@ -116,15 +146,18 @@ export function createSqliteLifecycleJournal(path) {
     },
     async recordExternalObservation(observation) {
       const {tenantId,source,requestId,subjectId,evidenceRef,committedAt}=observation
-      const detail=observation.kind==='provider'?{kind:'provider',action:observation.action,recordId:observation.recordId,destination:observation.destination}:observation.kind==='policy'?{kind:'policy',expectedRevision:observation.expectedRevision,revision:observation.revision}:null
+      const detail=detailOf(observation)
       if(!detail||!Number.isFinite(Date.parse(committedAt)))return 'conflict'
       const fingerprint=JSON.stringify(['external',subjectId,evidenceRef,detail])
       try {
         db.exec('BEGIN IMMEDIATE')
         const previous=lookup.get(tenantId,source,requestId)
-        if(previous){db.exec('ROLLBACK');return previous.fingerprint===fingerprint?'duplicate':'conflict'}
+        const reserved=previous?.fingerprint===reservation(subjectId,detail)
+        if(previous&&!reserved){db.exec('ROLLBACK');return previous.fingerprint===fingerprint?'duplicate':'conflict'}
+        if(!reserved&&(requestFull()||eventFull())){db.exec('ROLLBACK');return 'full'}
         const event={version:1,id:randomUUID(),type:'logging.external.confirmation.observed',tenantId,source,requestId,subjectId,evidenceRef,committedAt,...detail}
-        insertRequest.run(tenantId,source,requestId,fingerprint)
+        if(reserved)db.prepare('UPDATE logging_requests SET fingerprint=? WHERE tenant=? AND source=? AND request=?').run(fingerprint,tenantId,source,requestId)
+        else insertRequest.run(tenantId,source,requestId,fingerprint)
         insertEvent.run(event.id,JSON.stringify(event))
         db.exec('COMMIT')
         return 'committed'
@@ -136,6 +169,7 @@ export function createSqliteLifecycleJournal(path) {
       try {
         db.exec('BEGIN IMMEDIATE')
         if(lookup.get(tenantId,source,requestId)){db.exec('ROLLBACK');return 'conflict'}
+        if(requestFull()||eventFull()){db.exec('ROLLBACK');return 'full'}
         const event={version:1,id:randomUUID(),type:'logging.export.released',tenantId,source,requestId,subjectId,evidenceRef,committedAt,count}
         insertRequest.run(tenantId,source,requestId,JSON.stringify(['export',subjectId,evidenceRef]))
         insertEvent.run(event.id,JSON.stringify(event))
