@@ -1,5 +1,30 @@
 import type { Options, Delivery, Diagnostic, Receipt, DiagnosticQuery, Policy, LifecycleTarget, LifecycleResult, ExportResult, LifecyclePublisher, ProviderLifecycleRequest, ProviderLifecycleResult, PolicyChange, PolicyChangeResult } from '../contracts/types.ts';
 export declare function createLogging<E>(options: Options<E>): {
+    journalHealth: () => Promise<{
+        status: "unavailable";
+        capacity?: undefined;
+        requests?: undefined;
+        markers?: undefined;
+        events?: undefined;
+        reservations?: undefined;
+        pending?: undefined;
+        oldestPendingAt?: undefined;
+        oldestPendingAgeMs?: undefined;
+        observedAt?: undefined;
+        timeQuality?: undefined;
+    } | {
+        status: "completed";
+        capacity: number;
+        requests: number;
+        markers: number;
+        events: number;
+        reservations: number;
+        pending: number;
+        oldestPendingAt: string | null;
+        oldestPendingAgeMs: number | null;
+        observedAt: string;
+        timeQuality: "verified" | "degraded" | "unknown";
+    }>;
     runProviderLifecycle: (event: E, request: Pick<ProviderLifecycleRequest, "action" | "target" | "destination" | "requestId">) => Promise<ProviderLifecycleResult>;
     changePolicy: (event: E, input: PolicyChange) => Promise<PolicyChangeResult>;
     maintainJournal: (limit?: number) => Promise<{
@@ -101,6 +126,10 @@ export declare function createLogging<E>(options: Options<E>): {
     }>;
     readPipelineHealth: (event: E, query: DiagnosticQuery) => Promise<{
         status: "rejected";
+        observedAt?: undefined;
+        timeQuality?: undefined;
+        storage?: undefined;
+        withoutDelivery?: undefined;
         records?: undefined;
         delivered?: undefined;
         exhausted?: undefined;
@@ -108,6 +137,10 @@ export declare function createLogging<E>(options: Options<E>): {
         coverage?: undefined;
     } | {
         status: "completed";
+        observedAt: string;
+        timeQuality: "verified" | "degraded" | "unknown";
+        storage: "durable" | "process-local";
+        withoutDelivery: number;
         records: number;
         delivered: number;
         exhausted: number;
@@ -115,6 +148,10 @@ export declare function createLogging<E>(options: Options<E>): {
         coverage: "retained scoped records only; excludes intake losses, restricted and expired records; pagination ignored";
     } | {
         status: "unavailable";
+        observedAt?: undefined;
+        timeQuality?: undefined;
+        storage?: undefined;
+        withoutDelivery?: undefined;
         records?: undefined;
         delivered?: undefined;
         exhausted?: undefined;
@@ -130,6 +167,17 @@ export declare function createLogging<E>(options: Options<E>): {
         drops: number;
         uncertain: number;
         buffered: number;
+        intake: {
+            accepted: number;
+            rejected: number;
+            throttled: number;
+            unavailable: number;
+            uncertain: number;
+        };
+        activeIntake: number;
+        activeAgeMs: number | null;
+        retainedProcessLocal: number;
+        storage: "durable" | "process-local";
         quarantined: string[];
     };
     close: () => void;

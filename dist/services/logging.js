@@ -39,17 +39,20 @@ export function createLogging(options) {
     const buckets = new Map();
     // Uncertain external sinks remain quarantined until recomposition, so ignored aborts cannot accumulate.
     const quarantined = new Set();
-    let lifecycleBusy = false;
+    let lifecycleBusy = false, lifecycleGeneration = 0;
     let lifecycleAbort;
     let relayAbort;
     let lifecycleDone, relayDone;
     let finishLifecycle, finishRelay;
-    function beginLifecycle() { lifecycleBusy = true; lifecycleDone = new Promise(resolve => { finishLifecycle = resolve; }); }
-    function endLifecycle() { lifecycleBusy = false; finishLifecycle?.(); lifecycleDone = undefined; finishLifecycle = undefined; lifecycleAbort = undefined; }
+    function beginLifecycle() { lifecycleGeneration++; lifecycleBusy = true; lifecycleDone = new Promise(resolve => { finishLifecycle = resolve; }); }
+    function endLifecycle() { lifecycleGeneration++; lifecycleBusy = false; finishLifecycle?.(); lifecycleDone = undefined; finishLifecycle = undefined; lifecycleAbort = undefined; }
     function beginRelay() { relayBusy = true; relayDone = new Promise(resolve => { finishRelay = resolve; }); }
     function endRelay() { relayBusy = false; finishRelay?.(); relayDone = undefined; finishRelay = undefined; relayAbort = undefined; }
     let busy = false, closed = false, closing = false, drops = 0, uncertain = 0;
     let lastDelivery = 'unknown';
+    let activeSince = null;
+    const intake = { accepted: 0, rejected: 0, throttled: 0, unavailable: 0, uncertain: 0 };
+    const countReceipt = (receipt) => { intake[receipt.status] = Math.min(Number.MAX_SAFE_INTEGER, intake[receipt.status] + 1); return receipt; };
     let lastTime = -Infinity;
     let active;
     let activeAbort;
@@ -212,10 +215,11 @@ export function createLogging(options) {
     function submit(event, input) {
         if (closed || closing || busy || lifecycleBusy) {
             drops++;
-            return Promise.resolve({ status: 'unavailable', code: 'LOG_BUSY' });
+            return Promise.resolve(countReceipt({ status: 'unavailable', code: 'LOG_BUSY' }));
         }
         busy = true;
-        const task = perform(event, input).finally(() => { busy = false; active = undefined; });
+        activeSince = performance.now();
+        const task = perform(event, input).then(countReceipt).finally(() => { busy = false; active = undefined; activeSince = null; });
         active = task;
         return task;
     }
@@ -235,6 +239,8 @@ export function createLogging(options) {
         if (store && loaded.length > 10000)
             throw new Error('LOG_JOURNAL');
         const candidates = loaded.filter(x => !('restricted' in x && x.restricted) && matches(q, x.record) && (!store || Date.parse(x.record.receiptTime) > lastTime - retentionFor(x.record)));
+        if (closing || closed)
+            throw new Error('LOG_JOURNAL');
         if (!journal)
             return candidates;
         const result = [];
@@ -250,14 +256,22 @@ export function createLogging(options) {
             throw new Error('LOG_JOURNAL');
         return store ? result : result.filter(x => rows.some(r => r === x && !r.restricted));
     }
+    async function checkRead(event, action, q, generation) {
+        if (!await authorised(event, action, q) || lifecycleBusy || generation !== lifecycleGeneration || closing || closed)
+            throw new Error('LOG_READ_INVALIDATED');
+    }
     async function readDiagnostics(event, query) {
         const snapshot = snapshotQuery(query);
         if (!snapshot || !validQuery(snapshot) || !await authorised(event, 'logging.read', snapshot))
             return { status: 'rejected', records: [] };
         try {
+            const generation = lifecycleGeneration;
+            if (lifecycleBusy)
+                throw new Error('LOG_READ_INVALIDATED');
             expire(time().ms);
             const offset = snapshot.offset ?? 0;
-            const records = (await visibleEntries(snapshot)).slice(offset, offset + snapshot.limit).map(x => x.record);
+            const records = (await visibleEntries(snapshot)).slice(offset, offset + snapshot.limit).map(x => structuredClone(x.record));
+            await checkRead(event, 'logging.read', snapshot, generation);
             return { status: 'completed', records, coverage: store ? 'durable diagnostic projection; pagination may shift' : 'process-local; incomplete; pagination may shift' };
         }
         catch {
@@ -269,9 +283,14 @@ export function createLogging(options) {
         if (!snapshot || !validQuery(snapshot) || !await authorised(event, 'logging.delivery.read', snapshot))
             return { status: 'rejected', records: [] };
         try {
+            const generation = lifecycleGeneration;
+            if (lifecycleBusy)
+                throw new Error('LOG_READ_INVALIDATED');
             expire(time().ms);
             const offset = snapshot.offset ?? 0;
-            return { status: 'completed', records: (await visibleEntries(snapshot)).slice(offset, offset + snapshot.limit).map(x => ({ id: x.record.id, delivery: x.delivery.map(d => ({ ...d })) })), coverage: store ? 'durable diagnostic projection; unconfirmed delivery may be omitted' : 'process-local; incomplete; in-flight destinations may be omitted' };
+            const records = (await visibleEntries(snapshot)).slice(offset, offset + snapshot.limit).map(x => ({ id: x.record.id, delivery: x.delivery.map(d => ({ ...d })) }));
+            await checkRead(event, 'logging.delivery.read', snapshot, generation);
+            return { status: 'completed', records, coverage: store ? 'durable diagnostic projection; unconfirmed delivery may be omitted' : 'process-local; incomplete; in-flight destinations may be omitted' };
         }
         catch {
             return { status: 'unavailable', records: [] };
@@ -355,6 +374,8 @@ export function createLogging(options) {
                 }
                 if (outcome === 'conflict')
                     return { status: 'rejected', records: [] };
+                if (outcome === 'full')
+                    return { status: 'unavailable', records: [] };
                 if (outcome !== 'committed') {
                     close();
                     return { status: 'uncertain', records: [] };
@@ -362,7 +383,10 @@ export function createLogging(options) {
                 if (closing || closed)
                     return { status: 'unavailable', records: [] };
             }
-            return { status: 'completed-local', requestId, evidenceRef: approval.evidenceRef, records, coverage: store ? 'durable diagnostic projection only; no provider export' : 'process-local only; incomplete; no provider export' };
+            const releaseCaller = await lifecycleCaller(event, 'export', { ...q, requestId });
+            if (!releaseCaller || releaseCaller.subjectId !== caller.subjectId || closed || closing)
+                return { status: 'rejected', records: [] };
+            return { status: 'completed-local', requestId, evidenceRef: approval.evidenceRef, records: structuredClone(records), coverage: store ? 'durable diagnostic projection only; no provider export' : 'process-local only; incomplete; no provider export' };
         }
         catch {
             return { status: 'unavailable', records: [] };
@@ -405,6 +429,8 @@ export function createLogging(options) {
                 }
                 if (outcome === 'conflict')
                     return { status: 'rejected' };
+                if (outcome === 'full')
+                    return { status: 'unavailable' };
                 if (outcome !== 'committed' && outcome !== 'duplicate') {
                     close();
                     return { status: 'uncertain' };
@@ -428,6 +454,17 @@ export function createLogging(options) {
         }
         finally {
             endLifecycle();
+        }
+    }
+    async function reserveExternal(intent) {
+        if (!journal?.reserveExternal)
+            return 'unavailable';
+        try {
+            const result = await journal.reserveExternal(intent);
+            return result === 'reserved' ? 'reserved' : result === 'conflict' ? 'rejected' : result === 'full' ? 'unavailable' : 'uncertain';
+        }
+        catch {
+            return 'uncertain';
         }
     }
     async function observeExternal(observation) {
@@ -469,10 +506,15 @@ export function createLogging(options) {
                 return { status: 'rejected' };
             if (closed || closing)
                 return { status: 'unavailable' };
-            if (!journal?.recordExternalObservation)
+            if (!journal?.recordExternalObservation || !journal.reserveExternal)
                 return { status: 'unavailable' };
             if (action === 'recover' && await journal.visibility(q) !== 'visible')
                 return { status: 'blocked' };
+            if (closed || closing)
+                return { status: 'unavailable' };
+            const reservation = await reserveExternal({ kind: 'provider', tenantId: q.tenantId, source: q.source, recordId: q.id, action, destination, requestId, subjectId: caller.subjectId });
+            if (reservation !== 'reserved')
+                return { status: reservation };
             if (closed || closing)
                 return { status: 'unavailable' };
             const controller = new AbortController();
@@ -506,7 +548,7 @@ export function createLogging(options) {
     async function changePolicy(event, input) {
         if (!plain(input) || !fields(input, ['tenantId', 'source', 'expectedRevision', 'policy', 'requestId']) || !token(input.tenantId) || !token(input.source) || !token(input.expectedRevision) || !token(input.requestId) || !plain(input.policy) || !fields(input.policy, ['revision', 'rules']) || !token(input.policy.revision) || input.policy.revision === input.expectedRevision)
             return { status: 'rejected' };
-        if (!options.commitPolicy || !options.resolvePolicy || (journal && !journal.recordExternalObservation) || busy || lifecycleBusy || closing || closed)
+        if (!options.commitPolicy || !options.resolvePolicy || (journal && (!journal.recordExternalObservation || !journal.reserveExternal)) || busy || lifecycleBusy || closing || closed)
             return { status: 'unavailable' };
         const { tenantId, source, expectedRevision, requestId } = input;
         let change;
@@ -529,6 +571,13 @@ export function createLogging(options) {
                 return { status: 'rejected' };
             if ((await policy(tenantId, source))?.revision !== expectedRevision)
                 return { status: 'conflict' };
+            if (closed || closing)
+                return { status: 'unavailable' };
+            if (journal) {
+                const reservation = await reserveExternal({ kind: 'policy', tenantId, source, requestId, subjectId: caller.subjectId, expectedRevision, revision: change.policy.revision });
+                if (reservation !== 'reserved')
+                    return { status: reservation === 'rejected' ? 'conflict' : reservation };
+            }
             if (closed || closing)
                 return { status: 'unavailable' };
             try {
@@ -557,10 +606,33 @@ export function createLogging(options) {
         if (!q || !validQuery(q) || !await authorised(event, 'logging.health.read', q))
             return { status: 'rejected' };
         try {
-            expire(time().ms);
+            const generation = lifecycleGeneration;
+            if (lifecycleBusy)
+                throw new Error('LOG_READ_INVALIDATED');
+            const observed = time();
+            expire(observed.ms);
             const entries = await visibleEntries(q);
             const delivery = entries.flatMap(x => x.delivery);
-            return { status: 'completed', records: entries.length, delivered: delivery.filter(x => x.status === 'delivered').length, exhausted: delivery.filter(x => x.status === 'exhausted').length, uncertain: delivery.filter(x => x.status === 'uncertain').length, coverage: 'retained scoped records only; excludes intake losses, restricted and expired records; pagination ignored' };
+            const withoutDelivery = entries.filter(x => x.delivery.length === 0).length;
+            await checkRead(event, 'logging.health.read', q, generation);
+            return { status: 'completed', observedAt: observed.instant, timeQuality: observed.quality, storage: store ? 'durable' : 'process-local', withoutDelivery, records: entries.length, delivered: delivery.filter(x => x.status === 'delivered').length, exhausted: delivery.filter(x => x.status === 'exhausted').length, uncertain: delivery.filter(x => x.status === 'uncertain').length, coverage: 'retained scoped records only; excludes intake losses, restricted and expired records; pagination ignored' };
+        }
+        catch {
+            return { status: 'unavailable' };
+        }
+    }
+    // Deployment-wide durable metadata is deliberately not exposed through tenant HTTP queries.
+    async function journalHealth() {
+        if (!journal?.health)
+            return { status: 'unavailable' };
+        try {
+            const value = await journal.health();
+            const observed = time();
+            const counts = [value.requests, value.markers, value.events, value.reservations, value.pending];
+            if (!Number.isSafeInteger(value.capacity) || value.capacity < 1 || counts.some(n => !Number.isSafeInteger(n) || n < 0) || value.pending > value.events || value.reservations > value.requests || (value.oldestPendingAt !== null && !instant(value.oldestPendingAt)))
+                return { status: 'unavailable' };
+            const oldestPendingAgeMs = observed.quality === 'verified' && value.oldestPendingAt && Date.parse(value.oldestPendingAt) <= observed.ms ? observed.ms - Date.parse(value.oldestPendingAt) : null;
+            return { status: 'completed', capacity: value.capacity, requests: value.requests, markers: value.markers, events: value.events, reservations: value.reservations, pending: value.pending, oldestPendingAt: value.oldestPendingAt, oldestPendingAgeMs, observedAt: observed.instant, timeQuality: observed.quality };
         }
         catch {
             return { status: 'unavailable' };
@@ -721,5 +793,5 @@ export function createLogging(options) {
                 clearTimeout(timer);
         }
     }
-    return { runProviderLifecycle, changePolicy, maintainJournal, maintainRetention, relayLifecycle, submit, readDiagnostics, readDeliveryState, readEffectivePolicy, readPipelineHealth, exportDiagnostics, eraseDiagnostic: (event, target, requestId) => changeLocalRecord(event, 'erase', target, requestId), restrictDiagnostic: (event, target, requestId) => changeLocalRecord(event, 'restrict', target, requestId), hostHealth: () => ({ state: closed || quarantined.size ? 'degraded' : (busy || lifecycleBusy) ? 'busy' : 'unknown', lastDelivery, drops, uncertain, buffered: rows.length, quarantined: [...quarantined] }), close, shutdown };
+    return { journalHealth, runProviderLifecycle, changePolicy, maintainJournal, maintainRetention, relayLifecycle, submit, readDiagnostics, readDeliveryState, readEffectivePolicy, readPipelineHealth, exportDiagnostics, eraseDiagnostic: (event, target, requestId) => changeLocalRecord(event, 'erase', target, requestId), restrictDiagnostic: (event, target, requestId) => changeLocalRecord(event, 'restrict', target, requestId), hostHealth: () => ({ state: closed || quarantined.size ? 'degraded' : (busy || lifecycleBusy || relayBusy) ? 'busy' : 'unknown', lastDelivery, drops, uncertain, buffered: rows.length, intake: { ...intake }, activeIntake: busy ? 1 : 0, activeAgeMs: activeSince === null ? null : Math.max(0, performance.now() - activeSince), retainedProcessLocal: rows.length, storage: store ? 'durable' : 'process-local', quarantined: [...quarantined] }), close, shutdown };
 }

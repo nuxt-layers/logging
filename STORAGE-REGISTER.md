@@ -9,3 +9,5 @@ Optional diagnostic store persists sanitised records and delivery state in the s
 Purpose-specific retention ceilings are recorded on admission; current policy may shorten but not extend the admitted lifetime. Maintenance uses bounded rotating scans and does not delete held/unknown payloads.
 
 Optional governed journal maintenance deletes only aged, acknowledged outbox event payloads with verified acknowledgement time and independent preservation clearance. Pending/unknown/held events, request identities and restriction/erasure markers remain retained. Database pages, WAL and backup disposal are separate host obligations.
+
+SQLite journal metadata capacity defaults to 100000 rows per category (request identities, markers, and events plus reserved event slots), configurable 1–1000000. Existing over-limit data is preserved. Durable external reservations hold scoped identifiers, operation kind and target or policy revisions; pending reservations survive restarts. No automated retirement. Capacity exhaustion blocks new protected work rather than discarding evidence. Physical file/WAL/backup bounds remain host obligations.

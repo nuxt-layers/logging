@@ -31,6 +31,17 @@
     "destination": "Destination identifier",
     "action": "Provider action",
     "recover": "Recover",
-    "provider": "Request provider operation"
+    "provider": "Request provider operation",
+    "severity": "Severity",
+    "allSeverities": "All severities",
+    "severity.debug": "Debug",
+    "severity.info": "Information",
+    "severity.warn": "Warning",
+    "severity.error": "Error",
+    "severity.fatal": "Fatal",
+    "code": "Diagnostic code",
+    "correlation": "Correlation identifier",
+    "intent": "Operation to confirm",
+    "chooseOperation": "Choose an operation"
   }
 }
