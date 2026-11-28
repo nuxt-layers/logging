@@ -6,4 +6,4 @@ The independent service owns technical records and delivery projections, not sou
 
 Threats: forged tenant, untrusted producer, sensitive fields, sink timeout, cross-tenant read, policy capture, resource exhaustion and global health leakage. Host must bound provider latency and transport size, resolve verified policy freshness and classify identifier/numeric provenance. Sink ownership and retention must be documented by host. No legal hold or durable custody promise.
 
-Remaining: independently evidenced privileged policy changes, protected export/rights and legal holds, persistent recovery and lifecycle outbox, scoped aggregate health, real provider acceptance, package installation/build and lockfile/CI, protected Nuxt endpoints and optional GUI. No tests or builds executed by AI.
+Final implementation includes durable SQLite diagnostics, lifecycle outbox, protected lifecycle commands, version-specific retirement, scoped health, bounded retry and evidence-only reconciliation, optional Nuxt administration. Independent packaged and browser acceptance and CI remain pending. External providers are not asserted. No tests or builds executed by AI.

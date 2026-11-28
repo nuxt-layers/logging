@@ -15,6 +15,8 @@ export function createLogging(options) {
     const journal = store ?? options.lifecycleJournal;
     let relayBusy = false;
     let journalCursor;
+    let retirementCursor;
+    let sinkObservationFailures = 0;
     const journalRetention = options.journalRetention ? { ...options.journalRetention } : undefined;
     if (journalRetention && (!journal?.maintenance || !bounded(journalRetention.retentionMs, 3650 * 86400000) || typeof journalRetention.resolvePreservation !== 'function'))
         throw new Error('LOG_INVALID_CONFIG');
@@ -36,6 +38,22 @@ export function createLogging(options) {
     }
     let retentionCursor;
     const rows = [];
+    // Bounded process-lifetime scope counters; never attribute unauthenticated or busy intake.
+    const scopedIntake = new Map();
+    let scopeCoverageLimited = false;
+    function countScoped(key, receipt) {
+        let counts = scopedIntake.get(key);
+        if (!counts) {
+            if (scopedIntake.size >= capacity) {
+                scopeCoverageLimited = true;
+                return receipt;
+            }
+            counts = { accepted: 0, rejected: 0, throttled: 0, unavailable: 0, uncertain: 0 };
+            scopedIntake.set(key, counts);
+        }
+        counts[receipt.status] = Math.min(Number.MAX_SAFE_INTEGER, counts[receipt.status] + 1);
+        return receipt;
+    }
     const buckets = new Map();
     // Uncertain external sinks remain quarantined until recomposition, so ignored aborts cannot accumulate.
     const quarantined = new Set();
@@ -91,11 +109,24 @@ export function createLogging(options) {
             return null;
         return { revision: p.revision, rules: effectiveRules(floors, p.rules, source, new Set(external.keys())) };
     }
-    async function perform(event, input) {
+    async function observeSink(record, destination, state) {
+        if (!journal?.observeSink)
+            return;
+        try {
+            const stamp = time();
+            const result = await journal.observeSink({ tenantId: record.tenantId, source: record.source, destination, state, committedAt: stamp.instant, timeQuality: stamp.quality });
+            if (result === 'committed' || result === 'unchanged')
+                return;
+        }
+        catch { }
+        sinkObservationFailures = Math.min(Number.MAX_SAFE_INTEGER, sinkObservationFailures + 1);
+    }
+    async function perform(event, input, scope) {
         try {
             const producer = await options.resolveProducer(event);
             if (!producer || !token(producer.tenantId) || !token(producer.source) || (await options.decide(producer, 'logging.submit', { tenantId: producer.tenantId, source: producer.source })).allowed !== true)
                 return { status: 'rejected', code: 'LOG_DENIED' };
+            scope(JSON.stringify([producer.tenantId, producer.source]));
             const p = await policy(producer.tenantId, producer.source);
             if (!p)
                 return { status: 'unavailable', code: 'LOG_POLICY_UNAVAILABLE' };
@@ -155,7 +186,7 @@ export function createLogging(options) {
             activeAbort = controller;
             const local = await deliver(localSink, row, timeout, 1, controller.signal);
             lastDelivery = local.outcome;
-            const localState = { target: 'local', status: local.outcome === 'refused' ? 'exhausted' : local.outcome, attempts: local.attempts, time: local.time };
+            const localState = { target: 'local', status: local.outcome === 'refused' ? 'exhausted' : local.outcome, attempts: local.attempts, time: time().instant };
             if (store) {
                 try {
                     await store.updateDelivery({ tenantId: row.tenantId, source: row.source, id: row.id }, [localState]);
@@ -165,6 +196,7 @@ export function createLogging(options) {
                     return { status: 'uncertain', code: 'LOG_STORE_UNCERTAIN', id: row.id };
                 }
             }
+            await observeSink(row, 'local', local.outcome === 'delivered' ? 'ready' : 'degraded');
             if (local.outcome === 'refused') {
                 drops++;
                 return { status: 'unavailable', code: 'LOG_SINK_REFUSED' };
@@ -174,19 +206,21 @@ export function createLogging(options) {
                 closed = true;
                 return { status: 'uncertain', code: 'LOG_SINK_UNCERTAIN', id: row.id };
             }
-            const item = { record: row, restricted: false, delivery: [{ target: 'local', status: 'delivered', attempts: local.attempts, time: local.time }] };
+            const item = { record: row, restricted: false, delivery: [{ target: 'local', status: 'delivered', attempts: local.attempts, time: localState.time }] };
             if (!store && !closing && !closed)
                 rows.push(item);
             for (const target of rule.destinations ?? []) {
                 const ext = external.get(target);
                 if (!ext || quarantined.has(target) || controller.signal.aborted) {
-                    item.delivery.push({ target, status: 'exhausted', attempts: 0, time: new Date().toISOString() });
+                    item.delivery.push({ target, status: 'exhausted', attempts: 0, time: time().instant });
                     drops++;
+                    await observeSink(row, target, 'degraded');
                     continue;
                 }
                 const result = await deliver(ext.sink, row, timeout, ext.maxAttempts, controller.signal);
                 const status = result.outcome === 'refused' ? 'exhausted' : result.outcome;
-                item.delivery.push({ target, status, attempts: result.attempts, time: result.time });
+                item.delivery.push({ target, status, attempts: result.attempts, time: time().instant });
+                await observeSink(row, target, status === 'delivered' ? 'ready' : 'degraded');
                 if (status === 'uncertain') {
                     uncertain++;
                     quarantined.add(target);
@@ -219,7 +253,8 @@ export function createLogging(options) {
         }
         busy = true;
         activeSince = performance.now();
-        const task = perform(event, input).then(countReceipt).finally(() => { busy = false; active = undefined; activeSince = null; });
+        let scopeKey;
+        const task = perform(event, input, key => { scopeKey = key; }).then(receipt => countReceipt(scopeKey === undefined ? receipt : countScoped(scopeKey, receipt))).finally(() => { busy = false; active = undefined; activeSince = null; });
         active = task;
         return task;
     }
@@ -601,6 +636,104 @@ export function createLogging(options) {
             endLifecycle();
         }
     }
+    // Manual recovery is single-record, single-destination and requires durable reservation.
+    // Reconciliation asks for evidence only; it never invokes a sink write.
+    async function recoverDelivery(event, input) {
+        if (!plain(input) || !fields(input, ['target', 'destination', 'requestId', 'mode']) ||
+            !plain(input.target) || !fields(input.target, ['tenantId', 'source', 'id']) ||
+            ![input.target.tenantId, input.target.source, input.target.id, input.destination, input.requestId].every(token) ||
+            !['retry', 'reconcile'].includes(input.mode))
+            return { status: 'rejected' };
+        const request = structuredClone(input);
+        const { target, destination, requestId, mode } = request;
+        const action = mode === 'retry' ? 'delivery.retry' : 'delivery.reconcile';
+        const resource = { ...target, destination, requestId };
+        if (!store?.reserveDeliveryRecovery || !store.finishDeliveryRecovery || busy || lifecycleBusy || closing || closed)
+            return { status: 'unavailable' };
+        if (destination !== 'local' && !external.has(destination))
+            return { status: 'rejected' };
+        if (mode === 'reconcile' && !options.reconcileDelivery)
+            return { status: 'unavailable' };
+        beginLifecycle();
+        try {
+            const caller = await lifecycleCaller(event, action, resource);
+            if (!caller)
+                return { status: 'rejected' };
+            const approval = await approve(action, caller, requestId, target, destination);
+            if (approval.status !== 'approved')
+                return { status: approval.status === 'blocked' ? 'blocked' : 'unavailable' };
+            if (approval.preservation !== 'clear')
+                return { status: approval.preservation === 'held' ? 'blocked' : 'unavailable' };
+            const current = await lifecycleCaller(event, action, resource);
+            if (!current || current.subjectId !== caller.subjectId)
+                return { status: 'rejected' };
+            const stamp = time();
+            if (stamp.quality !== 'verified' || closing || closed)
+                return { status: 'unavailable' };
+            const record = (await store.load(target.tenantId, target.source, 10000)).find(x => x.record.tenantId === target.tenantId && x.record.source === target.source && x.record.id === target.id);
+            if (!record || stamp.ms - Date.parse(record.record.receiptTime) >= retentionFor(record.record) || await store.visibility(target) !== 'visible')
+                return { status: 'blocked' };
+            const previous = record.delivery.find(d => d.target === destination);
+            if (!previous)
+                return { status: 'blocked' };
+            if (mode === 'retry') {
+                // Never retry a skipped or uncertain attempt. Recheck current routing and classification.
+                if (previous.status !== 'exhausted' || previous.attempts < 1 || previous.attempts >= 3 || quarantined.has(destination))
+                    return { status: 'blocked' };
+                const p = await policy(target.tenantId, target.source);
+                const rule = p?.rules.find(r => r.source === target.source && r.code === record.record.code);
+                if (!rule || p?.revision !== record.record.policyRevision || rule.purpose !== record.record.purpose ||
+                    (destination !== 'local' && !rule.destinations?.includes(destination)))
+                    return { status: 'blocked' };
+            }
+            else if (previous.status !== 'uncertain')
+                return { status: 'blocked' };
+            const finalCaller = await lifecycleCaller(event, action, resource);
+            if (!finalCaller || finalCaller.subjectId !== caller.subjectId || closing || closed)
+                return { status: 'rejected' };
+            const reserved = await store.reserveDeliveryRecovery(request, previous, caller.subjectId, approval.evidenceRef, stamp.instant);
+            if (reserved !== 'reserved')
+                return { status: reserved === 'full' ? 'unavailable' : reserved };
+            if (closing || closed)
+                return { status: 'uncertain' };
+            const controller = new AbortController();
+            lifecycleAbort = controller;
+            let outcome = { status: 'uncertain' };
+            let timer;
+            try {
+                if (mode === 'retry') {
+                    const sink = destination === 'local' ? localSink : external.get(destination).sink;
+                    const result = await deliver(sink, record.record, timeout, 1, controller.signal);
+                    if (result.outcome === 'delivered' || result.outcome === 'refused')
+                        outcome = { status: result.outcome, evidenceRef: approval.evidenceRef };
+                }
+                else {
+                    const result = await Promise.race([options.reconcileDelivery(Object.freeze({ ...request, target: Object.freeze({ ...target }) }), controller.signal), new Promise(resolve => { timer = setTimeout(() => { controller.abort(); resolve({ status: 'uncertain' }); }, timeout); })]);
+                    if ((result?.status === 'delivered' || result?.status === 'refused') && token(result.evidenceRef))
+                        outcome = { status: result.status, evidenceRef: result.evidenceRef };
+                }
+            }
+            catch { }
+            finally {
+                if (timer !== undefined)
+                    clearTimeout(timer);
+            }
+            if (mode === 'retry' && outcome.status === 'uncertain')
+                quarantined.add(destination);
+            const finished = await store.finishDeliveryRecovery(request, outcome, time().instant);
+            if (finished !== 'committed')
+                return { status: 'uncertain' };
+            if (mode === 'retry')
+                await observeSink(record.record, destination, outcome.status === 'delivered' ? 'ready' : 'degraded');
+            return { status: outcome.status };
+        }
+        catch {
+            return { status: 'uncertain' };
+        }
+        finally {
+            endLifecycle();
+        }
+    }
     async function readPipelineHealth(event, query) {
         const q = snapshotQuery(query);
         if (!q || !validQuery(q) || !await authorised(event, 'logging.health.read', q))
@@ -614,8 +747,23 @@ export function createLogging(options) {
             const entries = await visibleEntries(q);
             const delivery = entries.flatMap(x => x.delivery);
             const withoutDelivery = entries.filter(x => x.delivery.length === 0).length;
+            const backlog = entries.filter(x => x.delivery.length === 0 || x.delivery.some(d => d.status !== 'delivered'));
+            const oldestBacklogAt = backlog.length ? backlog.map(x => x.record.receiptTime).sort((a, b) => Date.parse(a) - Date.parse(b))[0] : null;
+            const oldestBacklogAgeMs = observed.quality === 'verified' && oldestBacklogAt && Date.parse(oldestBacklogAt) <= observed.ms ? observed.ms - Date.parse(oldestBacklogAt) : null;
+            const severityDistribution = { debug: 0, info: 0, warn: 0, error: 0, fatal: 0 };
+            for (const entry of entries)
+                severityDistribution[entry.record.severity]++;
+            const destinations = [...new Set(delivery.map(d => d.target))].sort().map(target => {
+                const states = delivery.filter(d => d.target === target);
+                const last = states.reduce((a, b) => Date.parse(b.time) >= Date.parse(a.time) ? b : a);
+                return { target, state: last.status === 'delivered' ? 'ready' : 'degraded', observedAt: last.time, exhausted: states.filter(d => d.status === 'exhausted').length, uncertain: states.filter(d => d.status === 'uncertain').length };
+            });
+            // Scope-wide counters must not bypass a resource-filtered read permission.
+            const scopeOnly = { tenantId: q.tenantId, source: q.source };
+            const canReadScope = await authorised(event, 'logging.health.scope.read', scopeOnly);
             await checkRead(event, 'logging.health.read', q, generation);
-            return { status: 'completed', observedAt: observed.instant, timeQuality: observed.quality, storage: store ? 'durable' : 'process-local', withoutDelivery, records: entries.length, delivered: delivery.filter(x => x.status === 'delivered').length, exhausted: delivery.filter(x => x.status === 'exhausted').length, uncertain: delivery.filter(x => x.status === 'uncertain').length, coverage: 'retained scoped records only; excludes intake losses, restricted and expired records; pagination ignored' };
+            const scoped = canReadScope ? scopedIntake.get(JSON.stringify([q.tenantId, q.source])) : undefined;
+            return { status: 'completed', observedAt: observed.instant, timeQuality: observed.quality, storage: store ? 'durable' : 'process-local', withoutDelivery, backlogRecords: backlog.length, oldestBacklogAt, oldestBacklogAgeMs, severityDistribution, destinations, scopeIntake: scoped ? { ...scoped } : null, scopeIntakeCoverage: canReadScope ? (scopeCoverageLimited ? 'bounded-process-lifetime; some scopes omitted' : 'process-lifetime; excludes unauthorised and busy intake') : 'not-authorised', records: entries.length, delivered: delivery.filter(x => x.status === 'delivered').length, exhausted: delivery.filter(x => x.status === 'exhausted').length, uncertain: delivery.filter(x => x.status === 'uncertain').length, coverage: 'retained scoped records only; excludes intake losses, restricted and expired records; pagination ignored' };
         }
         catch {
             return { status: 'unavailable' };
@@ -769,6 +917,47 @@ export function createLogging(options) {
             endLifecycle();
         }
     }
+    // Host authority must establish expiry of replay rights and preservation obligations.
+    async function maintainRetirement(limit = 20) {
+        if (!store || !journal?.retirementCandidates || !journal.retire || !options.retirementAuthority || relayBusy || busy || lifecycleBusy || closing || closed || !bounded(limit, 100))
+            return { status: 'unavailable', removed: 0, held: 0 };
+        beginLifecycle();
+        let removed = 0, held = 0;
+        try {
+            if (time().quality !== 'verified')
+                return { status: 'unavailable', removed, held };
+            const candidates = await journal.retirementCandidates(limit, retirementCursor);
+            if (!Array.isArray(candidates) || candidates.length > limit)
+                return { status: 'unavailable', removed, held };
+            for (const candidate of candidates) {
+                if (closing || closed)
+                    return { status: 'unavailable', removed, held };
+                if (!['request', 'marker', 'recovery', 'sink'].includes(candidate.kind) || ![candidate.tenantId, candidate.source, candidate.id, candidate.version].every(token))
+                    return { status: 'unavailable', removed, held };
+                const snapshot = Object.freeze({ ...candidate });
+                retirementCursor = snapshot;
+                if (await options.retirementAuthority.authorise(snapshot) !== 'clear') {
+                    held++;
+                    continue;
+                }
+                if (closing || closed || time().quality !== 'verified')
+                    return { status: 'unavailable', removed, held };
+                if (await journal.retire(snapshot) === 'removed')
+                    removed++;
+                else
+                    held++;
+            }
+            if (candidates.length < limit)
+                retirementCursor = undefined;
+            return { status: 'completed', removed, held };
+        }
+        catch {
+            return { status: 'uncertain', removed, held };
+        }
+        finally {
+            endLifecycle();
+        }
+    }
     function close() {
         closing = true;
         closed = true;
@@ -793,5 +982,5 @@ export function createLogging(options) {
                 clearTimeout(timer);
         }
     }
-    return { journalHealth, runProviderLifecycle, changePolicy, maintainJournal, maintainRetention, relayLifecycle, submit, readDiagnostics, readDeliveryState, readEffectivePolicy, readPipelineHealth, exportDiagnostics, eraseDiagnostic: (event, target, requestId) => changeLocalRecord(event, 'erase', target, requestId), restrictDiagnostic: (event, target, requestId) => changeLocalRecord(event, 'restrict', target, requestId), hostHealth: () => ({ state: closed || quarantined.size ? 'degraded' : (busy || lifecycleBusy || relayBusy) ? 'busy' : 'unknown', lastDelivery, drops, uncertain, buffered: rows.length, intake: { ...intake }, activeIntake: busy ? 1 : 0, activeAgeMs: activeSince === null ? null : Math.max(0, performance.now() - activeSince), retainedProcessLocal: rows.length, storage: store ? 'durable' : 'process-local', quarantined: [...quarantined] }), close, shutdown };
+    return { recoverDelivery, maintainRetirement, journalHealth, runProviderLifecycle, changePolicy, maintainJournal, maintainRetention, relayLifecycle, submit, readDiagnostics, readDeliveryState, readEffectivePolicy, readPipelineHealth, exportDiagnostics, eraseDiagnostic: (event, target, requestId) => changeLocalRecord(event, 'erase', target, requestId), restrictDiagnostic: (event, target, requestId) => changeLocalRecord(event, 'restrict', target, requestId), hostHealth: () => ({ state: closed || quarantined.size ? 'degraded' : (busy || lifecycleBusy || relayBusy) ? 'busy' : 'unknown', lastDelivery, drops, uncertain, sinkObservationFailures, buffered: rows.length, intake: { ...intake }, activeIntake: busy ? 1 : 0, activeAgeMs: activeSince === null ? null : Math.max(0, performance.now() - activeSince), retainedProcessLocal: rows.length, storage: store ? 'durable' : 'process-local', quarantined: [...quarantined] }), close, shutdown };
 }

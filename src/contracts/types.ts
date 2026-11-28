@@ -11,7 +11,10 @@ export type DiagnosticQuery = { tenantId:string; source:string; from:string; to:
 export type Policy = { revision:string; rules:readonly Rule[] }
 export type ExternalSink = { id:string; sink:Sink; maxAttempts?:number }
 export type DeliveryState = { target:string; status:'delivered'|'exhausted'|'uncertain'; attempts:number; time:string }
-export type LifecycleAction = 'export' | 'erase' | 'restrict' | 'recover' | 'policy.change'
+export type DeliveryRecoveryRequest = {target:LifecycleTarget;destination:string;requestId:string;mode:'retry'|'reconcile'}
+export type DeliveryRecoveryResult = {status:'delivered'|'refused'|'uncertain'|'blocked'|'rejected'|'unavailable'}
+export type DeliveryRecoveryEvidence = {status:'delivered'|'refused';evidenceRef:string}|{status:'uncertain'}
+export type LifecycleAction = 'export' | 'erase' | 'restrict' | 'recover' | 'policy.change' | 'delivery.retry' | 'delivery.reconcile'
 export type LifecycleTarget = { tenantId:string; source:string; id:string }
 export type LifecycleApproval = {
   action:LifecycleAction
@@ -29,7 +32,7 @@ export type LifecycleResult =
 export type ExportResult =
   | { status:'completed-local'; requestId:string; evidenceRef:string; records:RecordEntry[]; coverage:string }
   | { status:'blocked'|'rejected'|'unavailable'|'uncertain'; records:never[] }
-export type LifecycleEvent = Readonly<ExternalObservation & {version:1;id:string;type:'logging.external.confirmation.observed'}> | Readonly<{
+export type LifecycleEvent = Readonly<SinkObservation & {version:1;id:string;type:'logging.sink.degraded'|'logging.sink.recovered'}> | Readonly<ExternalObservation & {version:1;id:string;type:'logging.external.confirmation.observed'}> | Readonly<{
   version:1; id:string; type:'logging.restricted'|'logging.erased'; tenantId:string; source:string;
   recordId:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string
 }> | Readonly<{
@@ -45,6 +48,9 @@ export type ExternalIntent = Omit<ExternalObservation,'committedAt'|'evidenceRef
   {kind:'provider';action:'erase'|'restrict'|'recover';recordId:string;destination:string} |
   {kind:'policy';expectedRevision:string;revision:string}
 )
+export type SinkObservation = {tenantId:string;source:string;destination:string;state:'ready'|'degraded';committedAt:string;timeQuality:RecordEntry['timeQuality']}
+export type RetirementCandidate = {kind:'request'|'marker'|'recovery'|'sink';tenantId:string;source:string;id:string;version:string}
+export type RetirementAuthority = {authorise(candidate:RetirementCandidate):Promise<'clear'|'held'|'unknown'>}
 export type JournalHealth = {capacity:number;requests:number;markers:number;events:number;reservations:number;pending:number;oldestPendingAt:string|null}
 export type ExportRelease = { tenantId:string; source:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string; count:number }
 export type LifecycleCommit = {
@@ -53,6 +59,8 @@ export type LifecycleCommit = {
 }
 export type StoredDiagnostic = { record:RecordEntry; delivery:DeliveryState[] }
 export type DiagnosticStore = LifecycleJournal & {
+  reserveDeliveryRecovery?(request:DeliveryRecoveryRequest,expected:DeliveryState,subjectId:string,evidenceRef:string,stamp:string):Promise<'reserved'|'blocked'|'full'|'uncertain'>
+  finishDeliveryRecovery?(request:DeliveryRecoveryRequest,result:DeliveryRecoveryEvidence,stamp:string):Promise<'committed'|'uncertain'>
   save(entry:StoredDiagnostic,capacity:number):Promise<'stored'|'full'|'uncertain'>
   load(tenantId:string,source:string,limit:number):Promise<StoredDiagnostic[]>
   updateDelivery(target:LifecycleTarget,delivery:DeliveryState[]):Promise<void>
@@ -76,6 +84,9 @@ export type LifecycleJournal = {
   commit(command:LifecycleCommit):Promise<'committed'|'duplicate'|'conflict'|'uncertain'|'full'>
   reserveExternal?(intent:ExternalIntent):Promise<'reserved'|'conflict'|'uncertain'|'full'>
   health?():Promise<JournalHealth>
+  observeSink?(observation:SinkObservation):Promise<'committed'|'unchanged'|'full'|'uncertain'>
+  retirementCandidates?(limit:number,after?:RetirementCandidate):Promise<RetirementCandidate[]>
+  retire?(candidate:RetirementCandidate):Promise<'removed'|'absent'|'blocked'>
   recordExternalObservation?(observation:ExternalObservation):Promise<'committed'|'duplicate'|'conflict'|'uncertain'|'full'>
   recordExportRelease?(release:ExportRelease):Promise<'committed'|'conflict'|'uncertain'|'full'>
   visibility(target:LifecycleTarget):Promise<'visible'|'restricted'|'erased'>
@@ -112,6 +123,8 @@ export type Options<E> = {
   diagnosticStore?: DiagnosticStore
   retentionAuthority?: OptionsRetention
   journalRetention?: JournalRetentionAuthority
+  retirementAuthority?: RetirementAuthority
+  reconcileDelivery?: (request:Readonly<DeliveryRecoveryRequest>,signal:AbortSignal)=>Promise<DeliveryRecoveryEvidence>
   providerLifecycle?: (request:ProviderLifecycleRequest,signal:AbortSignal)=>Promise<ProviderLifecycleResult>
   commitPolicy?: (change:PolicyChange,caller:Caller,approvalEvidenceRef:string)=>Promise<PolicyChangeResult>
   approveLifecycle?: (request:LifecycleApproval) => Promise<LifecycleDecision>

@@ -1,5 +1,19 @@
-import type { Options, Delivery, Diagnostic, Receipt, DiagnosticQuery, Policy, LifecycleTarget, LifecycleResult, ExportResult, LifecyclePublisher, ProviderLifecycleRequest, ProviderLifecycleResult, PolicyChange, PolicyChangeResult } from '../contracts/types.ts';
+import type { Options, Delivery, Diagnostic, Receipt, DiagnosticQuery, Policy, LifecycleTarget, LifecycleResult, ExportResult, LifecyclePublisher, ProviderLifecycleRequest, ProviderLifecycleResult, PolicyChange, PolicyChangeResult, DeliveryRecoveryRequest, DeliveryRecoveryResult } from '../contracts/types.ts';
 export declare function createLogging<E>(options: Options<E>): {
+    recoverDelivery: (event: E, input: DeliveryRecoveryRequest) => Promise<DeliveryRecoveryResult>;
+    maintainRetirement: (limit?: number) => Promise<{
+        status: "unavailable";
+        removed: number;
+        held: number;
+    } | {
+        status: "completed";
+        removed: number;
+        held: number;
+    } | {
+        status: "uncertain";
+        removed: number;
+        held: number;
+    }>;
     journalHealth: () => Promise<{
         status: "unavailable";
         capacity?: undefined;
@@ -130,6 +144,13 @@ export declare function createLogging<E>(options: Options<E>): {
         timeQuality?: undefined;
         storage?: undefined;
         withoutDelivery?: undefined;
+        backlogRecords?: undefined;
+        oldestBacklogAt?: undefined;
+        oldestBacklogAgeMs?: undefined;
+        severityDistribution?: undefined;
+        destinations?: undefined;
+        scopeIntake?: undefined;
+        scopeIntakeCoverage?: undefined;
         records?: undefined;
         delivered?: undefined;
         exhausted?: undefined;
@@ -141,6 +162,31 @@ export declare function createLogging<E>(options: Options<E>): {
         timeQuality: "verified" | "degraded" | "unknown";
         storage: "durable" | "process-local";
         withoutDelivery: number;
+        backlogRecords: number;
+        oldestBacklogAt: string | null;
+        oldestBacklogAgeMs: number | null;
+        severityDistribution: {
+            debug: number;
+            info: number;
+            warn: number;
+            error: number;
+            fatal: number;
+        };
+        destinations: {
+            target: string;
+            state: "degraded" | "ready";
+            observedAt: string;
+            exhausted: number;
+            uncertain: number;
+        }[];
+        scopeIntake: {
+            accepted: number;
+            rejected: number;
+            throttled: number;
+            unavailable: number;
+            uncertain: number;
+        } | null;
+        scopeIntakeCoverage: string;
         records: number;
         delivered: number;
         exhausted: number;
@@ -152,6 +198,13 @@ export declare function createLogging<E>(options: Options<E>): {
         timeQuality?: undefined;
         storage?: undefined;
         withoutDelivery?: undefined;
+        backlogRecords?: undefined;
+        oldestBacklogAt?: undefined;
+        oldestBacklogAgeMs?: undefined;
+        severityDistribution?: undefined;
+        destinations?: undefined;
+        scopeIntake?: undefined;
+        scopeIntakeCoverage?: undefined;
         records?: undefined;
         delivered?: undefined;
         exhausted?: undefined;
@@ -166,6 +219,7 @@ export declare function createLogging<E>(options: Options<E>): {
         lastDelivery: "unknown" | Delivery;
         drops: number;
         uncertain: number;
+        sinkObservationFailures: number;
         buffered: number;
         intake: {
             accepted: number;

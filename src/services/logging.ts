@@ -1,4 +1,4 @@
-import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision, LifecyclePublisher, ProviderLifecycleRequest, ProviderLifecycleResult, PolicyChange, PolicyChangeResult, AccessResource, ExternalObservation, ExternalIntent } from '../contracts/types.ts'
+import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision, LifecyclePublisher, ProviderLifecycleRequest, ProviderLifecycleResult, PolicyChange, PolicyChangeResult, AccessResource, ExternalObservation, ExternalIntent, RetirementCandidate, DeliveryRecoveryRequest, DeliveryRecoveryResult, DeliveryRecoveryEvidence } from '../contracts/types.ts'
 import { token, instant, bounded, levels, compileRules, effectiveRules, validateDiagnostic, diagnosticCode, plain, fields } from '../policy/validation.ts'
 import { deliver } from '../sinks/delivery.ts'
 
@@ -16,6 +16,8 @@ export function createLogging<E>(options: Options<E>) {
   const journal = store ?? options.lifecycleJournal
   let relayBusy=false
   let journalCursor:string|undefined
+  let retirementCursor:RetirementCandidate|undefined
+  let sinkObservationFailures=0
   const journalRetention=options.journalRetention?{...options.journalRetention}:undefined
   if(journalRetention&&(!journal?.maintenance||!bounded(journalRetention.retentionMs,3650*86400000)||typeof journalRetention.resolvePreservation!=='function'))throw new Error('LOG_INVALID_CONFIG')
   if (!bounded(capacity,10000) || !bounded(rate,10000) || !bounded(timeout,30000) || !bounded(retention,86400000*30) || !token(revision) || !localSink || typeof localSink.write !== 'function') throw new Error('LOG_INVALID_CONFIG')
@@ -32,6 +34,19 @@ export function createLogging<E>(options: Options<E>) {
   }
   let retentionCursor:LifecycleTarget|undefined
   const rows: {record:RecordEntry;delivery:DeliveryState[];restricted:boolean}[] = []
+  // Bounded process-lifetime scope counters; never attribute unauthenticated or busy intake.
+  const scopedIntake=new Map<string,{accepted:number;rejected:number;throttled:number;unavailable:number;uncertain:number}>()
+  let scopeCoverageLimited=false
+  function countScoped(key:string,receipt:Receipt):Receipt {
+    let counts=scopedIntake.get(key)
+    if(!counts){
+      if(scopedIntake.size>=capacity){scopeCoverageLimited=true;return receipt}
+      counts={accepted:0,rejected:0,throttled:0,unavailable:0,uncertain:0}
+      scopedIntake.set(key,counts)
+    }
+    counts[receipt.status]=Math.min(Number.MAX_SAFE_INTEGER,counts[receipt.status]+1)
+    return receipt
+  }
   const buckets = new Map<string,{count:number;minute:number}>()
   // Uncertain external sinks remain quarantined until recomposition, so ignored aborts cannot accumulate.
   const quarantined = new Set<string>()
@@ -79,10 +94,20 @@ export function createLogging<E>(options: Options<E>) {
     if(!p || !token(p.revision)) return null
     return {revision:p.revision,rules:effectiveRules(floors,p.rules,source,new Set(external.keys()))}
   }
-  async function perform(event:E,input:Diagnostic):Promise<Receipt> {
+  async function observeSink(record:RecordEntry,destination:string,state:'ready'|'degraded') {
+    if(!journal?.observeSink)return
+    try {
+      const stamp=time()
+      const result=await journal.observeSink({tenantId:record.tenantId,source:record.source,destination,state,committedAt:stamp.instant,timeQuality:stamp.quality})
+      if(result==='committed'||result==='unchanged')return
+    }catch{}
+    sinkObservationFailures=Math.min(Number.MAX_SAFE_INTEGER,sinkObservationFailures+1)
+  }
+  async function perform(event:E,input:Diagnostic,scope:(key:string)=>void):Promise<Receipt> {
     try {
       const producer=await options.resolveProducer(event)
       if(!producer || !token(producer.tenantId) || !token(producer.source) || (await options.decide(producer,'logging.submit',{tenantId:producer.tenantId,source:producer.source})).allowed!==true) return {status:'rejected',code:'LOG_DENIED'}
+      scope(JSON.stringify([producer.tenantId,producer.source]))
       const p=await policy(producer.tenantId,producer.source)
       if(!p) return {status:'unavailable',code:'LOG_POLICY_UNAVAILABLE'}
       const code=diagnosticCode(input)
@@ -114,23 +139,25 @@ export function createLogging<E>(options: Options<E>) {
       activeAbort=controller
       const local=await deliver(localSink,row,timeout,1,controller.signal)
       lastDelivery=local.outcome
-      const localState:DeliveryState={target:'local',status:local.outcome==='refused'?'exhausted':local.outcome,attempts:local.attempts,time:local.time}
+      const localState:DeliveryState={target:'local',status:local.outcome==='refused'?'exhausted':local.outcome,attempts:local.attempts,time:time().instant}
       if(store) {
         try {await store.updateDelivery({tenantId:row.tenantId,source:row.source,id:row.id},[localState])}
         catch {close();return {status:'uncertain',code:'LOG_STORE_UNCERTAIN',id:row.id}}
       }
+      await observeSink(row,'local',local.outcome==='delivered'?'ready':'degraded')
       if(local.outcome==='refused') {drops++;return {status:'unavailable',code:'LOG_SINK_REFUSED'}}
       if(local.outcome!=='delivered') {uncertain++;closed=true;return {status:'uncertain',code:'LOG_SINK_UNCERTAIN',id:row.id}}
-      const item={record:row,restricted:false,delivery:[{target:'local',status:'delivered' as const,attempts:local.attempts,time:local.time}] as DeliveryState[]}
+      const item={record:row,restricted:false,delivery:[{target:'local',status:'delivered' as const,attempts:local.attempts,time:localState.time}] as DeliveryState[]}
       if(!store && !closing && !closed) rows.push(item)
       for(const target of rule.destinations??[]) {
         const ext=external.get(target)
         if(!ext || quarantined.has(target) || controller.signal.aborted) {
-          item.delivery.push({target,status:'exhausted',attempts:0,time:new Date().toISOString()});drops++;continue
+          item.delivery.push({target,status:'exhausted',attempts:0,time:time().instant});drops++;await observeSink(row,target,'degraded');continue
         }
         const result=await deliver(ext.sink,row,timeout,ext.maxAttempts,controller.signal)
         const status=result.outcome==='refused'?'exhausted':result.outcome
-        item.delivery.push({target,status,attempts:result.attempts,time:result.time})
+        item.delivery.push({target,status,attempts:result.attempts,time:time().instant})
+        await observeSink(row,target,status==='delivered'?'ready':'degraded')
         if(status==='uncertain') {uncertain++;quarantined.add(target)}
         if(status==='exhausted') drops++
       }
@@ -145,7 +172,8 @@ export function createLogging<E>(options: Options<E>) {
   function submit(event:E,input:Diagnostic):Promise<Receipt> {
     if(closed||closing||busy||lifecycleBusy) {drops++;return Promise.resolve(countReceipt({status:'unavailable',code:'LOG_BUSY'}))}
     busy=true;activeSince=performance.now()
-    const task=perform(event,input).then(countReceipt).finally(()=>{busy=false;active=undefined;activeSince=null})
+    let scopeKey:string|undefined
+    const task=perform(event,input,key=>{scopeKey=key}).then(receipt=>countReceipt(scopeKey===undefined?receipt:countScoped(scopeKey,receipt))).finally(()=>{busy=false;active=undefined;activeSince=null})
     active=task
     return task
   }
@@ -388,6 +416,70 @@ export function createLogging<E>(options: Options<E>) {
     }catch{return {status:'unavailable'}}
     finally {endLifecycle()}
   }
+  // Manual recovery is single-record, single-destination and requires durable reservation.
+  // Reconciliation asks for evidence only; it never invokes a sink write.
+  async function recoverDelivery(event:E,input:DeliveryRecoveryRequest):Promise<DeliveryRecoveryResult> {
+    if(!plain(input)||!fields(input,['target','destination','requestId','mode'])||
+       !plain(input.target)||!fields(input.target,['tenantId','source','id'])||
+       ![input.target.tenantId,input.target.source,input.target.id,input.destination,input.requestId].every(token)||
+       !['retry','reconcile'].includes(input.mode))return {status:'rejected'}
+    const request=structuredClone(input)
+    const {target,destination,requestId,mode}=request
+    const action=mode==='retry'?'delivery.retry':'delivery.reconcile'
+    const resource={...target,destination,requestId}
+    if(!store?.reserveDeliveryRecovery||!store.finishDeliveryRecovery||busy||lifecycleBusy||closing||closed)return {status:'unavailable'}
+    if(destination!=='local'&&!external.has(destination))return {status:'rejected'}
+    if(mode==='reconcile'&&!options.reconcileDelivery)return {status:'unavailable'}
+    beginLifecycle()
+    try{
+      const caller=await lifecycleCaller(event,action,resource)
+      if(!caller)return {status:'rejected'}
+      const approval=await approve(action,caller,requestId,target,destination)
+      if(approval.status!=='approved')return {status:approval.status==='blocked'?'blocked':'unavailable'}
+      if(approval.preservation!=='clear')return {status:approval.preservation==='held'?'blocked':'unavailable'}
+      const current=await lifecycleCaller(event,action,resource)
+      if(!current||current.subjectId!==caller.subjectId)return {status:'rejected'}
+      const stamp=time()
+      if(stamp.quality!=='verified'||closing||closed)return {status:'unavailable'}
+      const record=(await store.load(target.tenantId,target.source,10000)).find(x=>x.record.tenantId===target.tenantId&&x.record.source===target.source&&x.record.id===target.id)
+      if(!record||stamp.ms-Date.parse(record.record.receiptTime)>=retentionFor(record.record)||await store.visibility(target)!=='visible')return {status:'blocked'}
+      const previous=record.delivery.find(d=>d.target===destination)
+      if(!previous)return {status:'blocked'}
+      if(mode==='retry'){
+        // Never retry a skipped or uncertain attempt. Recheck current routing and classification.
+        if(previous.status!=='exhausted'||previous.attempts<1||previous.attempts>=3||quarantined.has(destination))return {status:'blocked'}
+        const p=await policy(target.tenantId,target.source)
+        const rule=p?.rules.find(r=>r.source===target.source&&r.code===record.record.code)
+        if(!rule||p?.revision!==record.record.policyRevision||rule.purpose!==record.record.purpose||
+           (destination!=='local'&&!rule.destinations?.includes(destination)))return {status:'blocked'}
+      }else if(previous.status!=='uncertain')return {status:'blocked'}
+      const finalCaller=await lifecycleCaller(event,action,resource)
+      if(!finalCaller||finalCaller.subjectId!==caller.subjectId||closing||closed)return {status:'rejected'}
+      const reserved=await store.reserveDeliveryRecovery(request,previous,caller.subjectId!,approval.evidenceRef,stamp.instant)
+      if(reserved!=='reserved')return {status:reserved==='full'?'unavailable':reserved}
+      if(closing||closed)return {status:'uncertain'}
+      const controller=new AbortController()
+      lifecycleAbort=controller
+      let outcome:DeliveryRecoveryEvidence={status:'uncertain'}
+      let timer:ReturnType<typeof setTimeout>|undefined
+      try{
+        if(mode==='retry'){
+          const sink=destination==='local'?localSink:external.get(destination)!.sink
+          const result=await deliver(sink,record.record,timeout,1,controller.signal)
+          if(result.outcome==='delivered'||result.outcome==='refused')outcome={status:result.outcome,evidenceRef:approval.evidenceRef}
+        }else{
+          const result=await Promise.race([options.reconcileDelivery!(Object.freeze({...request,target:Object.freeze({...target})}),controller.signal),new Promise<DeliveryRecoveryEvidence>(resolve=>{timer=setTimeout(()=>{controller.abort();resolve({status:'uncertain'})},timeout)})])
+          if((result?.status==='delivered'||result?.status==='refused')&&token(result.evidenceRef))outcome={status:result.status,evidenceRef:result.evidenceRef}
+        }
+      }catch{}finally{if(timer!==undefined)clearTimeout(timer)}
+      if(mode==='retry'&&outcome.status==='uncertain')quarantined.add(destination)
+      const finished=await store.finishDeliveryRecovery(request,outcome,time().instant)
+      if(finished!=='committed')return {status:'uncertain'}
+      if(mode==='retry')await observeSink(record.record,destination,outcome.status==='delivered'?'ready':'degraded')
+      return {status:outcome.status}
+    }catch{return {status:'uncertain'}}
+    finally{endLifecycle()}
+  }
   async function readPipelineHealth(event:E,query:DiagnosticQuery) {
     const q=snapshotQuery(query)
     if(!q||!validQuery(q)||!await authorised(event,'logging.health.read',q))return {status:'rejected' as const}
@@ -399,8 +491,22 @@ export function createLogging<E>(options: Options<E>) {
       const entries=await visibleEntries(q)
       const delivery=entries.flatMap(x=>x.delivery)
       const withoutDelivery=entries.filter(x=>x.delivery.length===0).length
+      const backlog=entries.filter(x=>x.delivery.length===0||x.delivery.some(d=>d.status!=='delivered'))
+      const oldestBacklogAt=backlog.length?backlog.map(x=>x.record.receiptTime).sort((a,b)=>Date.parse(a)-Date.parse(b))[0]!:null
+      const oldestBacklogAgeMs=observed.quality==='verified'&&oldestBacklogAt&&Date.parse(oldestBacklogAt)<=observed.ms?observed.ms-Date.parse(oldestBacklogAt):null
+      const severityDistribution={debug:0,info:0,warn:0,error:0,fatal:0}
+      for(const entry of entries)severityDistribution[entry.record.severity]++
+      const destinations=[...new Set(delivery.map(d=>d.target))].sort().map(target=>{
+        const states=delivery.filter(d=>d.target===target)
+        const last=states.reduce((a,b)=>Date.parse(b.time)>=Date.parse(a.time)?b:a)
+        return {target,state:last.status==='delivered'?'ready' as const:'degraded' as const,observedAt:last.time,exhausted:states.filter(d=>d.status==='exhausted').length,uncertain:states.filter(d=>d.status==='uncertain').length}
+      })
+      // Scope-wide counters must not bypass a resource-filtered read permission.
+      const scopeOnly={tenantId:q.tenantId,source:q.source}
+      const canReadScope=await authorised(event,'logging.health.scope.read',scopeOnly)
       await checkRead(event,'logging.health.read',q,generation)
-      return {status:'completed' as const,observedAt:observed.instant,timeQuality:observed.quality,storage:store?'durable' as const:'process-local' as const,withoutDelivery,records:entries.length,delivered:delivery.filter(x=>x.status==='delivered').length,exhausted:delivery.filter(x=>x.status==='exhausted').length,uncertain:delivery.filter(x=>x.status==='uncertain').length,coverage:'retained scoped records only; excludes intake losses, restricted and expired records; pagination ignored' as const}
+      const scoped=canReadScope?scopedIntake.get(JSON.stringify([q.tenantId,q.source])):undefined
+      return {status:'completed' as const,observedAt:observed.instant,timeQuality:observed.quality,storage:store?'durable' as const:'process-local' as const,withoutDelivery,backlogRecords:backlog.length,oldestBacklogAt,oldestBacklogAgeMs,severityDistribution,destinations,scopeIntake:scoped?{...scoped}:null,scopeIntakeCoverage:canReadScope?(scopeCoverageLimited?'bounded-process-lifetime; some scopes omitted':'process-lifetime; excludes unauthorised and busy intake'):'not-authorised',records:entries.length,delivered:delivery.filter(x=>x.status==='delivered').length,exhausted:delivery.filter(x=>x.status==='exhausted').length,uncertain:delivery.filter(x=>x.status==='uncertain').length,coverage:'retained scoped records only; excludes intake losses, restricted and expired records; pagination ignored' as const}
     } catch {return {status:'unavailable' as const}}
   }
   // Deployment-wide durable metadata is deliberately not exposed through tenant HTTP queries.
@@ -495,6 +601,30 @@ export function createLogging<E>(options: Options<E>) {
     } catch {return {status:'uncertain' as const,removed,held}}
     finally {endLifecycle()}
   }
+  // Host authority must establish expiry of replay rights and preservation obligations.
+  async function maintainRetirement(limit=20) {
+    if(!store||!journal?.retirementCandidates||!journal.retire||!options.retirementAuthority||relayBusy||busy||lifecycleBusy||closing||closed||!bounded(limit,100))return {status:'unavailable' as const,removed:0,held:0}
+    beginLifecycle()
+    let removed=0,held=0
+    try {
+      if(time().quality!=='verified')return {status:'unavailable' as const,removed,held}
+      const candidates=await journal.retirementCandidates(limit,retirementCursor)
+      if(!Array.isArray(candidates)||candidates.length>limit)return {status:'unavailable' as const,removed,held}
+      for(const candidate of candidates){
+        if(closing||closed)return {status:'unavailable' as const,removed,held}
+        if(!['request','marker','recovery','sink'].includes(candidate.kind)||![candidate.tenantId,candidate.source,candidate.id,candidate.version].every(token))return {status:'unavailable' as const,removed,held}
+        const snapshot=Object.freeze({...candidate})
+        retirementCursor=snapshot
+        if(await options.retirementAuthority.authorise(snapshot)!=='clear'){held++;continue}
+        if(closing||closed||time().quality!=='verified')return {status:'unavailable' as const,removed,held}
+        if(await journal.retire(snapshot)==='removed')removed++
+        else held++
+      }
+      if(candidates.length<limit)retirementCursor=undefined
+      return {status:'completed' as const,removed,held}
+    }catch{return {status:'uncertain' as const,removed,held}}
+    finally{endLifecycle()}
+  }
   function close() {
     closing=true;closed=true;activeAbort?.abort();lifecycleAbort?.abort();relayAbort?.abort();rows.length=0;buckets.clear()
   }
@@ -508,5 +638,5 @@ export function createLogging<E>(options: Options<E>) {
       return await Promise.race([Promise.allSettled(pending).then(()=>({status:'completed' as const})),new Promise<{status:'uncertain'}>(resolve=>{timer=setTimeout(()=>resolve({status:'uncertain'}),timeout)})])
     } finally {if(timer!==undefined)clearTimeout(timer)}
   }
-  return {journalHealth,runProviderLifecycle,changePolicy,maintainJournal,maintainRetention,relayLifecycle,submit,readDiagnostics,readDeliveryState,readEffectivePolicy,readPipelineHealth,exportDiagnostics,eraseDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'erase',target,requestId),restrictDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'restrict',target,requestId),hostHealth:()=>({state:closed||quarantined.size?'degraded' as const:(busy||lifecycleBusy||relayBusy)?'busy' as const:'unknown' as const,lastDelivery,drops,uncertain,buffered:rows.length,intake:{...intake},activeIntake:busy?1:0,activeAgeMs:activeSince===null?null:Math.max(0,performance.now()-activeSince),retainedProcessLocal:rows.length,storage:store?'durable' as const:'process-local' as const,quarantined:[...quarantined]}),close,shutdown}
+  return {recoverDelivery,maintainRetirement,journalHealth,runProviderLifecycle,changePolicy,maintainJournal,maintainRetention,relayLifecycle,submit,readDiagnostics,readDeliveryState,readEffectivePolicy,readPipelineHealth,exportDiagnostics,eraseDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'erase',target,requestId),restrictDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'restrict',target,requestId),hostHealth:()=>({state:closed||quarantined.size?'degraded' as const:(busy||lifecycleBusy||relayBusy)?'busy' as const:'unknown' as const,lastDelivery,drops,uncertain,sinkObservationFailures,buffered:rows.length,intake:{...intake},activeIntake:busy?1:0,activeAgeMs:activeSince===null?null:Math.max(0,performance.now()-activeSince),retainedProcessLocal:rows.length,storage:store?'durable' as const:'process-local' as const,quarantined:[...quarantined]}),close,shutdown}
 }

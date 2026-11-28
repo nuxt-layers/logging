@@ -23,3 +23,13 @@ Durable protected export now commits a release event and unique scoped request i
 External confirmations now have a distinct durable observation event; Logging does not claim external atomicity. A failed local observation after external success returns uncertainty. Host-side authoritative reconciliation remains required after a crash between external mutation and local observation; replay of external operations must be idempotent at the authority.
 
 Current completion candidate: SQLite capacity bounds metadata rows and reserved event slots, not physical bytes. Reservations persist before external invocation; unmatched or uncertain reservations are not automatically retried or retired. Scoped reads reject changed local lifecycle generations and recheck permission; cross-process disclosure coordination remains a host duty. Export rechecks permission before returning payload. Host receipt counters and journal backlog are separated from scoped retained-record observations. No safe identity/marker retirement horizon is approved; saturation is a deployment blocker requiring governed reconciliation.
+
+### Durable sink transitions
+
+The SQLite journal records scoped destination observations and atomically emits degradation and recovery transitions. Initial ready observations do not imply recovery. Repeated states do not emit duplicate transitions; older observations are uncertain. Capacity exhaustion prevents the transition from committing. The adapter alone does not establish service-level observation coverage.
+
+Governed retirement is distinct from event compaction. The durable store selects bounded candidates, the host supplies a positive version-specific retirement decision, and SQLite atomically rechecks references and version. Pending reservations cannot retire. Marker removal requires no retained diagnostic or outstanding scoped request. The host must exclude replay and stale writers; no default legal or retention authority is assumed.
+
+Manual delivery recovery uses a durable pre-call reservation and bounded explicit-refusal retry. Uncertain outcomes can only be reconciled through qualified evidence, never automatically replayed. Retained backlog counts are not provider queue depth.
+
+Definitive recovery identities and obsolete sink projections participate in version-specific retirement. Pending and uncertain recovery identities remain protected. Recovery is exposed through explicit protected HTTP operations and confirmed delivery-screen controls.

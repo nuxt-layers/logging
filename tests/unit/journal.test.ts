@@ -66,7 +66,8 @@ test('expiry commits its event once and survives reopening',async()=>{
   const events=await journal.pending(10)
   assert.equal(events.length,1)
   assert.equal(events[0]?.type,'logging.expired')
-  assert.equal(events[0]?.recordId,'record')
+  assert.ok(events[0] && 'recordId' in events[0])
+  assert.equal(events[0].recordId,'record')
  } finally {journal.close();rmSync(dir,{recursive:true,force:true})}
 })
 
@@ -133,5 +134,43 @@ test('external reservation survives reopen and reserves confirmation capacity',a
   assert.equal((await journal.health!()).reservations,0)
   assert.equal((await journal.health!()).pending,1)
   assert.equal(await journal.reserveExternal!(intent),'conflict')
+ }finally{journal.close();rmSync(dir,{recursive:true,force:true})}
+})
+
+test('sink transitions are scoped, durable, deduplicated and capacity bounded',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'logging-sink-state-'))
+ const path=join(dir,'journal.sqlite')
+ let journal=createSqliteLifecycleJournal(path,2)
+ const observation={tenantId:'a',source:'worker',destination:'local',state:'degraded' as const,committedAt:command.committedAt,timeQuality:'verified' as const}
+ try{
+  assert.equal(await journal.observeSink!(observation),'committed')
+  journal.close();journal=createSqliteLifecycleJournal(path,2)
+  assert.equal(await journal.observeSink!(observation),'unchanged')
+  assert.equal(await journal.observeSink!({...observation,state:'ready',committedAt:'2026-11-27T00:00:00Z'}),'committed')
+  assert.equal(await journal.observeSink!(observation),'uncertain')
+  assert.equal(await journal.observeSink!({...observation,tenantId:'b'}),'full')
+  assert.deepEqual((await journal.pending(10)).map(e=>e.type),['logging.sink.degraded','logging.sink.recovered'])
+ }finally{journal.close();rmSync(dir,{recursive:true,force:true})}
+})
+
+test('retirement requires compacted references and rejects stale versions and pending reservations',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'logging-retirement-'))
+ const journal=createSqliteLifecycleJournal(join(dir,'journal.sqlite'))
+ try{
+  assert.equal(await journal.commit({...command,action:'erase'}),'committed')
+  assert.deepEqual(await journal.retirementCandidates!(10),[])
+  const event=(await journal.pending(10))[0]!
+  await journal.acknowledge(event.id,command.committedAt)
+  await journal.maintenance!.removeAcknowledged(event.id,command.committedAt)
+  const request=(await journal.retirementCandidates!(10))[0]!
+  assert.equal(request.kind,'request')
+  assert.equal(await journal.retire!({...request,version:'stale'}),'blocked')
+  assert.equal(await journal.retire!(request),'removed')
+  const marker=(await journal.retirementCandidates!(10))[0]!
+  assert.equal(marker.kind,'marker')
+  assert.equal(await journal.retire!(marker),'removed')
+  assert.equal(await journal.retire!(marker),'blocked')
+  assert.equal(await journal.reserveExternal!({kind:'provider',action:'erase',recordId:'record',destination:'local',tenantId:'a',source:'worker',requestId:'pending',subjectId:'operator'}),'reserved')
+  assert.deepEqual(await journal.retirementCandidates!(10),[])
  }finally{journal.close();rmSync(dir,{recursive:true,force:true})}
 })
