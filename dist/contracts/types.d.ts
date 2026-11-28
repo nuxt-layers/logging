@@ -78,7 +78,22 @@ export type DeliveryState = {
     attempts: number;
     time: string;
 };
-export type LifecycleAction = 'export' | 'erase' | 'restrict' | 'recover' | 'policy.change';
+export type DeliveryRecoveryRequest = {
+    target: LifecycleTarget;
+    destination: string;
+    requestId: string;
+    mode: 'retry' | 'reconcile';
+};
+export type DeliveryRecoveryResult = {
+    status: 'delivered' | 'refused' | 'uncertain' | 'blocked' | 'rejected' | 'unavailable';
+};
+export type DeliveryRecoveryEvidence = {
+    status: 'delivered' | 'refused';
+    evidenceRef: string;
+} | {
+    status: 'uncertain';
+};
+export type LifecycleAction = 'export' | 'erase' | 'restrict' | 'recover' | 'policy.change' | 'delivery.retry' | 'delivery.reconcile';
 export type LifecycleTarget = {
     tenantId: string;
     source: string;
@@ -231,6 +246,8 @@ export type StoredDiagnostic = {
     delivery: DeliveryState[];
 };
 export type DiagnosticStore = LifecycleJournal & {
+    reserveDeliveryRecovery?(request: DeliveryRecoveryRequest, expected: DeliveryState, subjectId: string, evidenceRef: string, stamp: string): Promise<'reserved' | 'blocked' | 'full' | 'uncertain'>;
+    finishDeliveryRecovery?(request: DeliveryRecoveryRequest, result: DeliveryRecoveryEvidence, stamp: string): Promise<'committed' | 'uncertain'>;
     save(entry: StoredDiagnostic, capacity: number): Promise<'stored' | 'full' | 'uncertain'>;
     load(tenantId: string, source: string, limit: number): Promise<StoredDiagnostic[]>;
     updateDelivery(target: LifecycleTarget, delivery: DeliveryState[]): Promise<void>;
@@ -334,6 +351,7 @@ export type Options<E> = {
     retentionAuthority?: OptionsRetention;
     journalRetention?: JournalRetentionAuthority;
     retirementAuthority?: RetirementAuthority;
+    reconcileDelivery?: (request: Readonly<DeliveryRecoveryRequest>, signal: AbortSignal) => Promise<DeliveryRecoveryEvidence>;
     providerLifecycle?: (request: ProviderLifecycleRequest, signal: AbortSignal) => Promise<ProviderLifecycleResult>;
     commitPolicy?: (change: PolicyChange, caller: Caller, approvalEvidenceRef: string) => Promise<PolicyChangeResult>;
     approveLifecycle?: (request: LifecycleApproval) => Promise<LifecycleDecision>;

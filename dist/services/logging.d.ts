@@ -1,5 +1,6 @@
-import type { Options, Delivery, Diagnostic, Receipt, DiagnosticQuery, Policy, LifecycleTarget, LifecycleResult, ExportResult, LifecyclePublisher, ProviderLifecycleRequest, ProviderLifecycleResult, PolicyChange, PolicyChangeResult } from '../contracts/types.ts';
+import type { Options, Delivery, Diagnostic, Receipt, DiagnosticQuery, Policy, LifecycleTarget, LifecycleResult, ExportResult, LifecyclePublisher, ProviderLifecycleRequest, ProviderLifecycleResult, PolicyChange, PolicyChangeResult, DeliveryRecoveryRequest, DeliveryRecoveryResult } from '../contracts/types.ts';
 export declare function createLogging<E>(options: Options<E>): {
+    recoverDelivery: (event: E, input: DeliveryRecoveryRequest) => Promise<DeliveryRecoveryResult>;
     maintainRetirement: (limit?: number) => Promise<{
         status: "unavailable";
         removed: number;
@@ -143,6 +144,9 @@ export declare function createLogging<E>(options: Options<E>): {
         timeQuality?: undefined;
         storage?: undefined;
         withoutDelivery?: undefined;
+        backlogRecords?: undefined;
+        oldestBacklogAt?: undefined;
+        oldestBacklogAgeMs?: undefined;
         severityDistribution?: undefined;
         destinations?: undefined;
         scopeIntake?: undefined;
@@ -158,6 +162,9 @@ export declare function createLogging<E>(options: Options<E>): {
         timeQuality: "verified" | "degraded" | "unknown";
         storage: "durable" | "process-local";
         withoutDelivery: number;
+        backlogRecords: number;
+        oldestBacklogAt: string | null;
+        oldestBacklogAgeMs: number | null;
         severityDistribution: {
             debug: number;
             info: number;
@@ -191,6 +198,9 @@ export declare function createLogging<E>(options: Options<E>): {
         timeQuality?: undefined;
         storage?: undefined;
         withoutDelivery?: undefined;
+        backlogRecords?: undefined;
+        oldestBacklogAt?: undefined;
+        oldestBacklogAgeMs?: undefined;
         severityDistribution?: undefined;
         destinations?: undefined;
         scopeIntake?: undefined;
