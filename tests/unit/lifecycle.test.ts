@@ -105,7 +105,34 @@ test('durable export fails closed unless release is committed',async()=>{
 
 test('durable policy confirmation requires a committed observation',async()=>{
  for(const outcome of ['committed','uncertain'] as const){
-  const service=setup({approveLifecycle:clear,resolvePolicy:async()=>({revision:'v1',rules:[]}),commitPolicy:async()=>({status:'committed',revision:'v2',evidenceRef:'provider-ref'}),lifecycleJournal:{commit:async()=> 'committed',visibility:async()=> 'visible',pending:async()=>[],acknowledge:async()=>{},recordExternalObservation:async observation=>{assert.equal(observation.kind,'policy');assert.equal(observation.evidenceRef,'provider-ref');return outcome}}})
+  const service=setup({approveLifecycle:clear,resolvePolicy:async()=>({revision:'v1',rules:[]}),commitPolicy:async()=>({status:'committed',revision:'v2',evidenceRef:'provider-ref'}),lifecycleJournal:{commit:async()=> 'committed',visibility:async()=> 'visible',pending:async()=>[],acknowledge:async()=>{},reserveExternal:async()=> 'reserved',recordExternalObservation:async observation=>{assert.equal(observation.kind,'policy');assert.equal(observation.evidenceRef,'provider-ref');return outcome}}})
   assert.equal((await service.changePolicy(event,{tenantId:'a',source:'worker',expectedRevision:'v1',requestId:'req',policy:{revision:'v2',rules:[]}})).status,outcome==='committed'?'committed':'uncertain')
+ }
+})
+
+test('durable collision prevents provider invocation',async()=>{
+ let calls=0
+ const service=setup({approveLifecycle:clear,providerLifecycle:async()=>{calls++;return {status:'confirmed',evidenceRef:'proof'}},lifecycleJournal:{commit:async()=> 'committed',visibility:async()=> 'visible',pending:async()=>[],acknowledge:async()=>{},reserveExternal:async()=> 'conflict',recordExternalObservation:async()=> 'committed'}})
+ assert.equal((await service.runProviderLifecycle(event,{action:'erase',target:{tenantId:'a',source:'worker',id:'record'},destination:'local',requestId:'req'})).status,'rejected')
+ assert.equal(calls,0)
+})
+test('read permission revoked while projection is obtained fails closed',async()=>{
+ let allowed=true
+ const service=setup({decide:async()=>({allowed,reason:'test'}),lifecycleJournal:{commit:async()=> 'committed',visibility:async()=>{allowed=false;return 'visible'},pending:async()=>[],acknowledge:async()=>{}}})
+ await service.submit(event,diagnostic)
+ assert.deepEqual(await service.readDiagnostics(event,q),{status:'unavailable',records:[]})
+})
+test('host intake receipt counters and scoped provenance remain distinct',async()=>{
+ const service=setup()
+ await service.submit(event,diagnostic)
+ assert.equal(service.hostHealth().intake.accepted,1)
+ assert.equal(service.hostHealth().activeIntake,0)
+ const health=await service.readPipelineHealth(event,q)
+ assert.equal(health.status,'completed')
+ if(health.status==='completed'){
+  assert.equal(health.storage,'process-local')
+  assert.equal(health.observedAt,stamp)
+  assert.equal(health.timeQuality,'unknown')
+  assert.equal(health.withoutDelivery,0)
  }
 })
