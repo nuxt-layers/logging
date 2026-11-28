@@ -102,3 +102,36 @@ test('external confirmation observation survives reopen and deduplicates',async(
   assert.equal(await journal.visibility(command.target),'visible')
  } finally {journal.close();rmSync(dir,{recursive:true,force:true})}
 })
+
+test('bounded journal preserves markers and request identities at capacity',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'logging-bounded-'))
+ const journal=createSqliteLifecycleJournal(join(dir,'journal.sqlite'),1)
+ try{
+  assert.equal(await journal.commit(command),'committed')
+  assert.equal(await journal.commit({...command,requestId:'other'}),'full')
+  assert.equal(await journal.commit(command),'duplicate')
+  assert.equal(await journal.visibility(command.target),'restricted')
+  const health=await journal.health!()
+  assert.equal(health.capacity,1)
+  assert.equal(health.requests,1)
+  assert.equal(health.pending,1)
+ }finally{journal.close();rmSync(dir,{recursive:true,force:true})}
+})
+test('external reservation survives reopen and reserves confirmation capacity',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'logging-reservation-'))
+ const path=join(dir,'journal.sqlite')
+ let journal=createSqliteLifecycleJournal(path,1)
+ const intent={kind:'provider' as const,action:'erase' as const,recordId:'record',destination:'local',tenantId:'a',source:'worker',requestId:'external',subjectId:'operator'}
+ try{
+  assert.equal(await journal.reserveExternal!(intent),'reserved')
+  assert.equal((await journal.health!()).reservations,1)
+  journal.close();journal=createSqliteLifecycleJournal(path,1)
+  assert.equal(await journal.reserveExternal!(intent),'uncertain')
+  assert.equal(await journal.reserveExternal!({...intent,destination:'other'}),'conflict')
+  assert.equal(await journal.commit(command),'full')
+  assert.equal(await journal.recordExternalObservation!({...intent,evidenceRef:'proof',committedAt:command.committedAt}),'committed')
+  assert.equal((await journal.health!()).reservations,0)
+  assert.equal((await journal.health!()).pending,1)
+  assert.equal(await journal.reserveExternal!(intent),'conflict')
+ }finally{journal.close();rmSync(dir,{recursive:true,force:true})}
+})
