@@ -15,6 +15,8 @@ export function createLogging(options) {
     const journal = store ?? options.lifecycleJournal;
     let relayBusy = false;
     let journalCursor;
+    let retirementCursor;
+    let sinkObservationFailures = 0;
     const journalRetention = options.journalRetention ? { ...options.journalRetention } : undefined;
     if (journalRetention && (!journal?.maintenance || !bounded(journalRetention.retentionMs, 3650 * 86400000) || typeof journalRetention.resolvePreservation !== 'function'))
         throw new Error('LOG_INVALID_CONFIG');
@@ -91,6 +93,18 @@ export function createLogging(options) {
             return null;
         return { revision: p.revision, rules: effectiveRules(floors, p.rules, source, new Set(external.keys())) };
     }
+    async function observeSink(record, destination, state) {
+        if (!journal?.observeSink)
+            return;
+        try {
+            const stamp = time();
+            const result = await journal.observeSink({ tenantId: record.tenantId, source: record.source, destination, state, committedAt: stamp.instant, timeQuality: stamp.quality });
+            if (result === 'committed' || result === 'unchanged')
+                return;
+        }
+        catch { }
+        sinkObservationFailures = Math.min(Number.MAX_SAFE_INTEGER, sinkObservationFailures + 1);
+    }
     async function perform(event, input) {
         try {
             const producer = await options.resolveProducer(event);
@@ -155,7 +169,7 @@ export function createLogging(options) {
             activeAbort = controller;
             const local = await deliver(localSink, row, timeout, 1, controller.signal);
             lastDelivery = local.outcome;
-            const localState = { target: 'local', status: local.outcome === 'refused' ? 'exhausted' : local.outcome, attempts: local.attempts, time: local.time };
+            const localState = { target: 'local', status: local.outcome === 'refused' ? 'exhausted' : local.outcome, attempts: local.attempts, time: time().instant };
             if (store) {
                 try {
                     await store.updateDelivery({ tenantId: row.tenantId, source: row.source, id: row.id }, [localState]);
@@ -165,6 +179,7 @@ export function createLogging(options) {
                     return { status: 'uncertain', code: 'LOG_STORE_UNCERTAIN', id: row.id };
                 }
             }
+            await observeSink(row, 'local', local.outcome === 'delivered' ? 'ready' : 'degraded');
             if (local.outcome === 'refused') {
                 drops++;
                 return { status: 'unavailable', code: 'LOG_SINK_REFUSED' };
@@ -174,19 +189,21 @@ export function createLogging(options) {
                 closed = true;
                 return { status: 'uncertain', code: 'LOG_SINK_UNCERTAIN', id: row.id };
             }
-            const item = { record: row, restricted: false, delivery: [{ target: 'local', status: 'delivered', attempts: local.attempts, time: local.time }] };
+            const item = { record: row, restricted: false, delivery: [{ target: 'local', status: 'delivered', attempts: local.attempts, time: localState.time }] };
             if (!store && !closing && !closed)
                 rows.push(item);
             for (const target of rule.destinations ?? []) {
                 const ext = external.get(target);
                 if (!ext || quarantined.has(target) || controller.signal.aborted) {
-                    item.delivery.push({ target, status: 'exhausted', attempts: 0, time: new Date().toISOString() });
+                    item.delivery.push({ target, status: 'exhausted', attempts: 0, time: time().instant });
                     drops++;
+                    await observeSink(row, target, 'degraded');
                     continue;
                 }
                 const result = await deliver(ext.sink, row, timeout, ext.maxAttempts, controller.signal);
                 const status = result.outcome === 'refused' ? 'exhausted' : result.outcome;
-                item.delivery.push({ target, status, attempts: result.attempts, time: result.time });
+                item.delivery.push({ target, status, attempts: result.attempts, time: time().instant });
+                await observeSink(row, target, status === 'delivered' ? 'ready' : 'degraded');
                 if (status === 'uncertain') {
                     uncertain++;
                     quarantined.add(target);
@@ -614,8 +631,11 @@ export function createLogging(options) {
             const entries = await visibleEntries(q);
             const delivery = entries.flatMap(x => x.delivery);
             const withoutDelivery = entries.filter(x => x.delivery.length === 0).length;
+            const severityDistribution = { debug: 0, info: 0, warn: 0, error: 0, fatal: 0 };
+            for (const entry of entries)
+                severityDistribution[entry.record.severity]++;
             await checkRead(event, 'logging.health.read', q, generation);
-            return { status: 'completed', observedAt: observed.instant, timeQuality: observed.quality, storage: store ? 'durable' : 'process-local', withoutDelivery, records: entries.length, delivered: delivery.filter(x => x.status === 'delivered').length, exhausted: delivery.filter(x => x.status === 'exhausted').length, uncertain: delivery.filter(x => x.status === 'uncertain').length, coverage: 'retained scoped records only; excludes intake losses, restricted and expired records; pagination ignored' };
+            return { status: 'completed', observedAt: observed.instant, timeQuality: observed.quality, storage: store ? 'durable' : 'process-local', withoutDelivery, severityDistribution, records: entries.length, delivered: delivery.filter(x => x.status === 'delivered').length, exhausted: delivery.filter(x => x.status === 'exhausted').length, uncertain: delivery.filter(x => x.status === 'uncertain').length, coverage: 'retained scoped records only; excludes intake losses, restricted and expired records; pagination ignored' };
         }
         catch {
             return { status: 'unavailable' };
@@ -769,6 +789,47 @@ export function createLogging(options) {
             endLifecycle();
         }
     }
+    // Host authority must establish expiry of replay rights and preservation obligations.
+    async function maintainRetirement(limit = 20) {
+        if (!store || !journal?.retirementCandidates || !journal.retire || !options.retirementAuthority || relayBusy || busy || lifecycleBusy || closing || closed || !bounded(limit, 100))
+            return { status: 'unavailable', removed: 0, held: 0 };
+        beginLifecycle();
+        let removed = 0, held = 0;
+        try {
+            if (time().quality !== 'verified')
+                return { status: 'unavailable', removed, held };
+            const candidates = await journal.retirementCandidates(limit, retirementCursor);
+            if (!Array.isArray(candidates) || candidates.length > limit)
+                return { status: 'unavailable', removed, held };
+            for (const candidate of candidates) {
+                if (closing || closed)
+                    return { status: 'unavailable', removed, held };
+                if (!['request', 'marker'].includes(candidate.kind) || ![candidate.tenantId, candidate.source, candidate.id, candidate.version].every(token))
+                    return { status: 'unavailable', removed, held };
+                const snapshot = Object.freeze({ ...candidate });
+                retirementCursor = snapshot;
+                if (await options.retirementAuthority.authorise(snapshot) !== 'clear') {
+                    held++;
+                    continue;
+                }
+                if (closing || closed || time().quality !== 'verified')
+                    return { status: 'unavailable', removed, held };
+                if (await journal.retire(snapshot) === 'removed')
+                    removed++;
+                else
+                    held++;
+            }
+            if (candidates.length < limit)
+                retirementCursor = undefined;
+            return { status: 'completed', removed, held };
+        }
+        catch {
+            return { status: 'uncertain', removed, held };
+        }
+        finally {
+            endLifecycle();
+        }
+    }
     function close() {
         closing = true;
         closed = true;
@@ -793,5 +854,5 @@ export function createLogging(options) {
                 clearTimeout(timer);
         }
     }
-    return { journalHealth, runProviderLifecycle, changePolicy, maintainJournal, maintainRetention, relayLifecycle, submit, readDiagnostics, readDeliveryState, readEffectivePolicy, readPipelineHealth, exportDiagnostics, eraseDiagnostic: (event, target, requestId) => changeLocalRecord(event, 'erase', target, requestId), restrictDiagnostic: (event, target, requestId) => changeLocalRecord(event, 'restrict', target, requestId), hostHealth: () => ({ state: closed || quarantined.size ? 'degraded' : (busy || lifecycleBusy || relayBusy) ? 'busy' : 'unknown', lastDelivery, drops, uncertain, buffered: rows.length, intake: { ...intake }, activeIntake: busy ? 1 : 0, activeAgeMs: activeSince === null ? null : Math.max(0, performance.now() - activeSince), retainedProcessLocal: rows.length, storage: store ? 'durable' : 'process-local', quarantined: [...quarantined] }), close, shutdown };
+    return { maintainRetirement, journalHealth, runProviderLifecycle, changePolicy, maintainJournal, maintainRetention, relayLifecycle, submit, readDiagnostics, readDeliveryState, readEffectivePolicy, readPipelineHealth, exportDiagnostics, eraseDiagnostic: (event, target, requestId) => changeLocalRecord(event, 'erase', target, requestId), restrictDiagnostic: (event, target, requestId) => changeLocalRecord(event, 'restrict', target, requestId), hostHealth: () => ({ state: closed || quarantined.size ? 'degraded' : (busy || lifecycleBusy || relayBusy) ? 'busy' : 'unknown', lastDelivery, drops, uncertain, sinkObservationFailures, buffered: rows.length, intake: { ...intake }, activeIntake: busy ? 1 : 0, activeAgeMs: activeSince === null ? null : Math.max(0, performance.now() - activeSince), retainedProcessLocal: rows.length, storage: store ? 'durable' : 'process-local', quarantined: [...quarantined] }), close, shutdown };
 }
