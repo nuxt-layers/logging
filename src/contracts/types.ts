@@ -49,7 +49,7 @@ export type ExternalIntent = Omit<ExternalObservation,'committedAt'|'evidenceRef
   {kind:'policy';expectedRevision:string;revision:string}
 )
 export type SinkObservation = {tenantId:string;source:string;destination:string;state:'ready'|'degraded';committedAt:string;timeQuality:RecordEntry['timeQuality']}
-export type RetirementCandidate = {kind:'request'|'marker';tenantId:string;source:string;id:string;version:string}
+export type RetirementCandidate = {kind:'request'|'marker'|'recovery'|'sink';tenantId:string;source:string;id:string;version:string}
 export type RetirementAuthority = {authorise(candidate:RetirementCandidate):Promise<'clear'|'held'|'unknown'>}
 export type JournalHealth = {capacity:number;requests:number;markers:number;events:number;reservations:number;pending:number;oldestPendingAt:string|null}
 export type ExportRelease = { tenantId:string; source:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string; count:number }

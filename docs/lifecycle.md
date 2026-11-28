@@ -31,3 +31,5 @@ The SQLite journal records scoped destination observations and atomically emits 
 Governed retirement is distinct from event compaction. The durable store selects bounded candidates, the host supplies a positive version-specific retirement decision, and SQLite atomically rechecks references and version. Pending reservations cannot retire. Marker removal requires no retained diagnostic or outstanding scoped request. The host must exclude replay and stale writers; no default legal or retention authority is assumed.
 
 Manual delivery recovery uses a durable pre-call reservation and bounded explicit-refusal retry. Uncertain outcomes can only be reconciled through qualified evidence, never automatically replayed. Retained backlog counts are not provider queue depth.
+
+Definitive recovery identities and obsolete sink projections participate in version-specific retirement. Pending and uncertain recovery identities remain protected. Recovery is exposed through explicit protected HTTP operations and confirmed delivery-screen controls.

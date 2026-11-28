@@ -1,6 +1,6 @@
 import { defineEventHandler, getHeader, readRawBody, setResponseHeader, createError } from 'h3'
 import type { H3Event } from 'h3'
-import type { DiagnosticQuery, LifecycleTarget, PolicyChange, ProviderLifecycleRequest } from '../../../src/index'
+import type { DiagnosticQuery, LifecycleTarget, PolicyChange, ProviderLifecycleRequest, DeliveryRecoveryRequest } from '../../../src/index'
 import { getLogging } from '../../utils/logging'
 
 export default defineEventHandler(async (event: H3Event) => {
@@ -35,6 +35,11 @@ export default defineEventHandler(async (event: H3Event) => {
     case 'erase': return service.eraseDiagnostic(event,input as LifecycleTarget,body.requestId)
     case 'restrict': return service.restrictDiagnostic(event,input as LifecycleTarget,body.requestId)
     case 'provider': return service.runProviderLifecycle(event,input as Pick<ProviderLifecycleRequest,'action'|'target'|'destination'|'requestId'>)
+    case 'delivery.retry':
+    case 'delivery.reconcile': {
+      if(!input||input.mode!==(body.operation==='delivery.retry'?'retry':'reconcile'))throw createError({statusCode:400})
+      return service.recoverDelivery(event,input as DeliveryRecoveryRequest)
+    }
     case 'policy.change': return service.changePolicy(event,input as PolicyChange)
     default: throw createError({statusCode:400})
   }

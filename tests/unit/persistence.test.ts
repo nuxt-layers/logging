@@ -44,3 +44,44 @@ test('persistent diagnostic recovery, restriction and hold-aware expiry',async()
   service.close()
  } finally {store.close();rmSync(dir,{recursive:true,force:true})}
 })
+
+test('manual delivery retry is authorised, bounded and cannot replay a completed request',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'logging-retry-'))
+ const store=createSqliteLifecycleJournal(join(dir,'journal.sqlite'))
+ let calls=0
+ let allowed=true
+ const service=createLogging<typeof event>({resolveCaller:async e=>e,resolveProducer:async e=>e,decide:async(_c,action)=>({allowed:action!=='logging.delivery.retry'||allowed,reason:'test'}),now:()=>({instant:stamp,quality:'verified'}),localSink:{write:async()=> 'delivered'},externalSinks:[{id:'remote',sink:{write:async()=>{calls++;return calls===1?'refused':'delivered'}}}],rules:[{source:'worker',code:'worker.done',purpose:'diagnostics',attributes:[],destinations:['remote']}],policyRevision:'v1',retentionMs:1000,diagnosticStore:store,approveLifecycle:async()=>({status:'approved',evidenceRef:'approval',preservation:'clear'})})
+ try{
+  const receipt=await service.submit(event,diagnostic)
+  const request={target:{tenantId:'a',source:'worker',id:receipt.id!},destination:'remote',requestId:'retry-1',mode:'retry' as const}
+  allowed=false
+  assert.equal((await service.recoverDelivery(event,request)).status,'rejected')
+  allowed=true
+  assert.equal((await service.recoverDelivery({...event,tenantId:'b'},request)).status,'rejected')
+  assert.equal((await service.recoverDelivery(event,request)).status,'delivered')
+  assert.equal((await service.recoverDelivery(event,request)).status,'blocked')
+  assert.equal(calls,2)
+  assert.equal((await service.readDeliveryState(event,q)).records[0]?.delivery[1]?.attempts,2)
+ }finally{service.close();store.close();rmSync(dir,{recursive:true,force:true})}
+})
+test('interrupted retry reservation survives reopen and requires reconciliation without writes',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'logging-reconcile-'))
+ const path=join(dir,'journal.sqlite')
+ let store=createSqliteLifecycleJournal(path)
+ let writes=0
+ const options=():Options<typeof event>=>({resolveCaller:async e=>e,resolveProducer:async e=>e,decide:async()=>({allowed:true,reason:'test'}),now:()=>({instant:stamp,quality:'verified'}),localSink:{write:async()=> 'delivered'},externalSinks:[{id:'remote',sink:{write:async()=>{writes++;return 'refused'}}}],rules:[{source:'worker',code:'worker.done',purpose:'diagnostics',attributes:[],destinations:['remote']}],policyRevision:'v1',retentionMs:1000,diagnosticStore:store,approveLifecycle:async()=>({status:'approved',evidenceRef:'approval',preservation:'clear'}),reconcileDelivery:async()=>({status:'delivered',evidenceRef:'provider-evidence'})})
+ let service=createLogging(options())
+ try{
+  const receipt=await service.submit(event,diagnostic)
+  const target={tenantId:'a',source:'worker',id:receipt.id!}
+  const request={target,destination:'remote',requestId:'interrupted',mode:'retry' as const}
+  const previous=(await store.load('a','worker',10))[0]!.delivery[1]!
+  assert.equal(await store.reserveDeliveryRecovery!(request,previous,'operator','approval',stamp),'reserved')
+  service.close();store.close()
+  store=createSqliteLifecycleJournal(path);service=createLogging(options())
+  assert.equal((await service.recoverDelivery(event,{...request,requestId:'unsafe-replay'})).status,'blocked')
+  assert.equal((await service.recoverDelivery(event,{...request,requestId:'reconcile',mode:'reconcile'})).status,'delivered')
+  assert.equal(writes,1)
+  assert.equal((await service.readDeliveryState(event,q)).records[0]?.delivery[1]?.status,'delivered')
+ }finally{service.close();store.close();rmSync(dir,{recursive:true,force:true})}
+})

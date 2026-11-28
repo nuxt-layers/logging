@@ -47,14 +47,14 @@ export function createSqliteLifecycleJournal(path, capacity = 100000) {
     // Additive migration: legacy acknowledgements have unknown time and cannot be compacted.
     if(!db.prepare('PRAGMA table_info(logging_outbox)').all().some(c=>c.name==='acknowledged_at'))db.exec('ALTER TABLE logging_outbox ADD COLUMN acknowledged_at INTEGER')
     // A fresh opaque version on every insert/update prevents stale retirement approvals.
-    for(const table of ['logging_requests','logging_lifecycle']){
+    for(const table of ['logging_requests','logging_lifecycle','logging_delivery_recovery','logging_sink_state']){
       if(!db.prepare('PRAGMA table_info('+table+')').all().some(c=>c.name==='retirement_version')){
         db.exec('ALTER TABLE '+table+" ADD COLUMN retirement_version TEXT NOT NULL DEFAULT ''")
       }
       db.exec("UPDATE "+table+" SET retirement_version=lower(hex(randomblob(16))) WHERE retirement_version=''")
     }
   } catch (error) { db.close(); throw error }
-  const lookup = db.prepare('SELECT fingerprint FROM logging_requests WHERE tenant=? AND source=? AND request=?')
+  const lookup = db.prepare("SELECT fingerprint FROM logging_requests WHERE tenant=?1 AND source=?2 AND request=?3 UNION ALL SELECT 'delivery-recovery' FROM logging_delivery_recovery WHERE tenant=?1 AND source=?2 AND request=?3 LIMIT 1")
   const insertRequest = db.prepare('INSERT INTO logging_requests(tenant,source,request,fingerprint,retirement_version) VALUES(?,?,?,?,lower(hex(randomblob(16))))')
   const mutate = db.prepare(`INSERT INTO logging_lifecycle(tenant,source,record,state,retirement_version) VALUES(?,?,?,?,lower(hex(randomblob(16))))
     ON CONFLICT(tenant,source,record) DO UPDATE SET state=CASE
@@ -85,7 +85,18 @@ export function createSqliteLifecycleJournal(path, capacity = 100000) {
     FROM logging_lifecycle l
     WHERE NOT EXISTS(SELECT 1 FROM logging_diagnostics d WHERE d.tenant=l.tenant AND d.source=l.source AND d.record=l.record)
       AND NOT EXISTS(SELECT 1 FROM logging_requests r WHERE r.tenant=l.tenant AND r.source=l.source)
+      AND NOT EXISTS(SELECT 1 FROM logging_delivery_recovery r WHERE r.tenant=l.tenant AND r.source=l.source AND r.record=l.record)
       AND NOT EXISTS(SELECT 1 FROM logging_outbox o WHERE json_extract(o.payload,'$.tenantId')=l.tenant AND json_extract(o.payload,'$.source')=l.source AND json_extract(o.payload,'$.recordId')=l.record)
+    UNION ALL
+    SELECT 'recovery',r.tenant,r.source,r.request,r.retirement_version
+    FROM logging_delivery_recovery r
+    WHERE r.state IN ('delivered','refused')
+      AND NOT EXISTS(SELECT 1 FROM logging_diagnostics d WHERE d.tenant=r.tenant AND d.source=r.source AND d.record=r.record)
+    UNION ALL
+    SELECT 'sink',s.tenant,s.source,s.destination,s.retirement_version
+    FROM logging_sink_state s
+    WHERE NOT EXISTS(SELECT 1 FROM logging_outbox o WHERE json_extract(o.payload,'$.tenantId')=s.tenant AND json_extract(o.payload,'$.source')=s.source AND json_extract(o.payload,'$.destination')=s.destination)
+      AND NOT EXISTS(SELECT 1 FROM logging_diagnostics d WHERE d.tenant=s.tenant AND d.source=s.source)
   `
   return {
     async retirementCandidates(limit,after) {
@@ -94,12 +105,12 @@ export function createSqliteLifecycleJournal(path, capacity = 100000) {
     },
     async retire(candidate) {
       const {kind,tenantId,source,id,version}=candidate
-      if(kind!=='request'&&kind!=='marker')return 'blocked'
+      if(!['request','marker','recovery','sink'].includes(kind))return 'blocked'
       try {
         db.exec('BEGIN IMMEDIATE')
         const current=db.prepare('SELECT * FROM ('+eligible+') WHERE kind=? AND tenantId=? AND source=? AND id=?').get(kind,tenantId,source,id)
         if(!current||current.version!==version){db.exec('ROLLBACK');return 'blocked'}
-        const sql=kind==='request'?'DELETE FROM logging_requests WHERE tenant=? AND source=? AND request=? AND retirement_version=?':'DELETE FROM logging_lifecycle WHERE tenant=? AND source=? AND record=? AND retirement_version=?'
+        const sql=({request:'DELETE FROM logging_requests WHERE tenant=? AND source=? AND request=? AND retirement_version=?',marker:'DELETE FROM logging_lifecycle WHERE tenant=? AND source=? AND record=? AND retirement_version=?',recovery:'DELETE FROM logging_delivery_recovery WHERE tenant=? AND source=? AND request=? AND retirement_version=?',sink:'DELETE FROM logging_sink_state WHERE tenant=? AND source=? AND destination=? AND retirement_version=?'})[kind]
         const result=db.prepare(sql).run(tenantId,source,id,version)
         db.exec('COMMIT');return result.changes?'removed':'absent'
       }catch(error){try{db.exec('ROLLBACK')}catch{}throw error}
@@ -120,7 +131,7 @@ export function createSqliteLifecycleJournal(path, capacity = 100000) {
         if((!previous&&db.prepare('SELECT COUNT(*) AS n FROM logging_sink_state').get().n>=capacity)||(transition&&eventFull())){
           db.exec('ROLLBACK');return 'full'
         }
-        db.prepare('INSERT INTO logging_sink_state VALUES(?,?,?,?,?) ON CONFLICT(tenant,source,destination) DO UPDATE SET state=excluded.state,observed_at=excluded.observed_at').run(tenantId,source,destination,state,committedAt)
+        db.prepare('INSERT INTO logging_sink_state(tenant,source,destination,state,observed_at,retirement_version) VALUES(?,?,?,?,?,lower(hex(randomblob(16)))) ON CONFLICT(tenant,source,destination) DO UPDATE SET state=excluded.state,observed_at=excluded.observed_at,retirement_version=excluded.retirement_version').run(tenantId,source,destination,state,committedAt)
         if(transition){
           const event={version:1,id:randomUUID(),type:state==='degraded'?'logging.sink.degraded':'logging.sink.recovered',tenantId,source,destination,state,committedAt,timeQuality}
           insertEvent.run(event.id,JSON.stringify(event))
@@ -177,7 +188,7 @@ export function createSqliteLifecycleJournal(path, capacity = 100000) {
           db.exec('ROLLBACK');return 'blocked'
         }
         if(db.prepare('SELECT COUNT(*) AS n FROM logging_delivery_recovery').get().n>=capacity){db.exec('ROLLBACK');return 'full'}
-        db.prepare('INSERT INTO logging_delivery_recovery VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(tenantId,source,requestId,id,destination,mode,subjectId,evidenceRef,'pending',null,stamp)
+        db.prepare('INSERT INTO logging_delivery_recovery(tenant,source,request,record,destination,mode,subject,approval,state,evidence,stamp,retirement_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,lower(hex(randomblob(16))))').run(tenantId,source,requestId,id,destination,mode,subjectId,evidenceRef,'pending',null,stamp)
         // Reserve before the external call. A crash can never make this a definite refusal.
         if(mode==='retry'){
           const delivery=JSON.parse(row.delivery).map(d=>d.target===destination?{...d,status:'uncertain',attempts:d.attempts+1,time:stamp}:d)
@@ -201,9 +212,9 @@ export function createSqliteLifecycleJournal(path, capacity = 100000) {
         if(!current||current.status!=='uncertain'){db.exec('ROLLBACK');return 'uncertain'}
         const status=result.status==='refused'?'exhausted':result.status
         db.prepare('UPDATE logging_diagnostics SET delivery=? WHERE tenant=? AND source=? AND record=?').run(JSON.stringify(delivery.map(d=>d.target===destination?{...d,status,time:stamp}:d)),tenantId,source,id)
-        db.prepare('UPDATE logging_delivery_recovery SET state=?,evidence=?,stamp=? WHERE tenant=? AND source=? AND request=?').run(result.status,result.evidenceRef??null,stamp,tenantId,source,requestId)
+        db.prepare('UPDATE logging_delivery_recovery SET state=?,evidence=?,stamp=?,retirement_version=lower(hex(randomblob(16))) WHERE tenant=? AND source=? AND request=?').run(result.status,result.evidenceRef??null,stamp,tenantId,source,requestId)
         if(mode==='reconcile'&&result.status!=='uncertain'){
-          db.prepare("UPDATE logging_delivery_recovery SET state=?,evidence=?,stamp=? WHERE tenant=? AND source=? AND record=? AND destination=? AND state='pending'").run(result.status,result.evidenceRef,stamp,tenantId,source,id,destination)
+          db.prepare("UPDATE logging_delivery_recovery SET state=?,evidence=?,stamp=?,retirement_version=lower(hex(randomblob(16))) WHERE tenant=? AND source=? AND record=? AND destination=? AND state IN ('pending','uncertain')").run(result.status,result.evidenceRef,stamp,tenantId,source,id,destination)
         }
         db.exec('COMMIT');return 'committed'
       }catch{try{db.exec('ROLLBACK')}catch{}return 'uncertain'}

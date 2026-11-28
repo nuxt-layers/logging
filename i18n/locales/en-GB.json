@@ -59,6 +59,13 @@
     "health.uncertain": "Uncertain deliveries",
     "health.withoutDelivery": "Records without recorded delivery",
     "health.coverage": "Coverage",
-    "technicalDetails": "Technical response details"
+    "technicalDetails": "Technical response details",
+    "outcome.delivered": "Destination acknowledged delivery; storage is not independently established.",
+    "outcome.refused": "Destination refused delivery.",
+    "health.backlogRecords": "Retained records with incomplete delivery",
+    "deliveryRecovery": "Protected delivery recovery",
+    "retryDelivery": "Retry explicit refusal",
+    "reconcileDelivery": "Reconcile uncertain delivery",
+    "executeRecovery": "Submit recovery request"
   }
 }

@@ -13,8 +13,8 @@ const intent=ref('')
 const routes=[['overview','/logging'],['records','/logging/records'],['delivery','/logging/delivery'],['settings','/logging/settings'],['data','/logging/data-management']]
 const operation=computed(()=>({overview:'health',records:'records',detail:'records',delivery:'delivery',settings:'policy',data:'records'}[props.section]))
 const detailId=computed(()=>props.section==='detail'?String(route.params.id??''):recordId.value)
-const outcome=computed(()=>{const r=result.value as {status?:string}|null;return typeof r?.status==='string'&&['completed','completed-local','committed','confirmed','blocked','rejected','unavailable','uncertain','conflict'].includes(r.status)?r.status:'unknown'})
-const health=computed(()=>{const r=result.value as {records?:number;delivered?:number;exhausted?:number;uncertain?:number;withoutDelivery?:number;coverage?:string}|null;return props.section==='overview'&&r&&typeof r.records==='number'?r:null})
+const outcome=computed(()=>{const r=result.value as {status?:string}|null;return typeof r?.status==='string'&&['completed','completed-local','committed','confirmed','blocked','rejected','unavailable','uncertain','conflict','delivered','refused'].includes(r.status)?r.status:'unknown'})
+const health=computed(()=>{const r=result.value as {records?:number;delivered?:number;exhausted?:number;uncertain?:number;withoutDelivery?:number;backlogRecords?:number;coverage?:string}|null;return props.section==='overview'&&r&&typeof r.records==='number'?r:null})
 const rows=computed(()=>{const r=result.value as {records?:unknown[]}|null;return Array.isArray(r?.records)?r.records:[]})
 function query(){
  return {tenantId:tenantId.value,source:source.value,from:new Date(from.value).toISOString(),to:new Date(to.value).toISOString(),limit:20,offset:offset.value,...(detailId.value?{id:detailId.value}:{}),...(severity.value?{severity:severity.value}:{}),...(code.value?{code:code.value}:{}),...(correlation.value?{correlation:correlation.value}:{})}
@@ -25,11 +25,12 @@ async function call(op:string=operation.value){
  result.value=null;notice.value='';busy.value=true
  try {
   const target={tenantId:tenantId.value,source:source.value,id:detailId.value}
-  const mutating=['erase','restrict','provider','policy.change','export'].includes(op)
+  const mutating=['erase','restrict','provider','policy.change','export','delivery.retry','delivery.reconcile'].includes(op)
   if(mutating&&(!confirmed.value||intent.value!==op)){notice.value=t('logging.confirmRequired');return}
   let input:unknown
   if(op==='policy')input={tenantId:tenantId.value,source:source.value}
   else if(op==='erase'||op==='restrict')input=target
+  else if(op==='delivery.retry'||op==='delivery.reconcile')input={target,destination:destination.value,requestId:requestId.value,mode:op==='delivery.retry'?'retry':'reconcile'}
   else if(op==='provider')input={action:action.value,target,destination:destination.value,requestId:requestId.value}
   else if(op==='policy.change')input={...JSON.parse(policy.value),tenantId:tenantId.value,source:source.value,requestId:requestId.value}
   else input=query()
@@ -56,7 +57,7 @@ watch(()=>route.fullPath,()=>{tenantId.value='';source.value='';recordId.value='
    <template v-if="section!=='settings'">
     <label>{{ t('logging.from') }}<input class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="from" required type="datetime-local" @input="clear"></label>
     <label>{{ t('logging.to') }}<input class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="to" required type="datetime-local" @input="clear"></label>
-    <label v-if="section==='data'">{{ t('logging.recordId') }}<input class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="recordId" maxlength="96" @input="clear"></label>
+    <label v-if="section==='data'||section==='delivery'">{{ t('logging.recordId') }}<input class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="recordId" maxlength="96" @input="clear"></label>
     <label v-if="section!=='detail'">{{ t('logging.severity') }}<select class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="severity"><option value="">{{ t('logging.allSeverities') }}</option><option v-for="level in ['debug','info','warn','error','fatal']" :key="level" :value="level">{{ t('logging.severity.'+level) }}</option></select></label>
     <label v-if="section!=='detail'">{{ t('logging.code') }}<input class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="code" maxlength="96"></label>
     <label v-if="section!=='detail'">{{ t('logging.correlation') }}<input class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="correlation" maxlength="96"></label>
@@ -67,7 +68,7 @@ watch(()=>route.fullPath,()=>{tenantId.value='';source.value='';recordId.value='
   <template v-if="result">
    <h2>{{ t('logging.result') }}</h2>
    <p>{{ t('logging.outcome.'+outcome) }}</p>
-   <dl v-if="health"><template v-for="key in (['records','delivered','exhausted','uncertain','withoutDelivery'] as const)" :key="key"><dt>{{ t('logging.health.'+key) }}</dt><dd>{{ health[key] }}</dd></template></dl>
+   <dl v-if="health"><template v-for="key in (['records','delivered','exhausted','uncertain','withoutDelivery','backlogRecords'] as const)" :key="key"><dt>{{ t('logging.health.'+key) }}</dt><dd>{{ health[key] }}</dd></template></dl>
    <p v-if="health">{{ t('logging.health.coverage') }}: {{ health.coverage }}</p>
    <ul v-if="section==='records'&&rows.length"><li v-for="row in rows" :key="(row as any).id"><NuxtLink class="text-pen-link-default hover:bg-fill-link-hover hover:text-pen-link-hover focus-visible:outline-focus focus-visible:outline-edge-link-focus" :to="'/logging/records/'+encodeURIComponent((row as any).id)">{{ (row as any).code }} — {{ (row as any).id }}</NuxtLink></li></ul>
    <details><summary>{{ t('logging.technicalDetails') }}</summary><pre tabindex="0" class="border border-edge-base-default bg-fill-base-default text-pen-base-default focus-visible:outline-focus focus-visible:outline-edge-base-focus">{{ JSON.stringify(result,null,2) }}</pre></details>
@@ -76,6 +77,14 @@ watch(()=>route.fullPath,()=>{tenantId.value='';source.value='';recordId.value='
     <button class="rounded-control border border-edge-primary-default bg-fill-primary-default text-pen-primary-default hover:bg-fill-primary-hover hover:text-pen-primary-hover hover:border-edge-primary-hover focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-primary-focus disabled:bg-fill-primary-disabled disabled:text-pen-primary-disabled disabled:border-edge-primary-disabled" :disabled="busy||rows.length<20" @click="offset+=20;call()">{{ t('logging.next') }}</button>
    </div>
   </template>
+  <fieldset v-if="section==='delivery'" class="border border-edge-base-default p-step-sm">
+   <legend>{{ t('logging.deliveryRecovery') }}</legend>
+   <label>{{ t('logging.requestId') }}<input v-model="requestId" maxlength="96" class="border border-edge-input-default bg-fill-input-default text-pen-input-default"></label>
+   <label>{{ t('logging.destination') }}<input v-model="destination" maxlength="96" class="border border-edge-input-default bg-fill-input-default text-pen-input-default"></label>
+   <label>{{ t('logging.intent') }}<select v-model="intent" class="border border-edge-input-default bg-fill-input-default text-pen-input-default"><option value="">{{ t('logging.chooseOperation') }}</option><option value="delivery.retry">{{ t('logging.retryDelivery') }}</option><option value="delivery.reconcile">{{ t('logging.reconcileDelivery') }}</option></select></label>
+   <label><input v-model="confirmed" type="checkbox">{{ t('logging.confirm') }}</label>
+   <button type="button" class="rounded-control border border-edge-primary-default bg-fill-primary-default text-pen-primary-default focus-visible:outline-focus focus-visible:outline-edge-primary-focus" :disabled="busy||!confirmed||!tenantId||!source||!recordId||!requestId||!destination||!['delivery.retry','delivery.reconcile'].includes(intent)" @click="call(intent)">{{ t('logging.executeRecovery') }}</button>
+  </fieldset>
   <fieldset class="border border-edge-base-default p-step-sm" v-if="section==='settings'||section==='data'">
    <legend>{{ t('logging.protected') }}</legend>
    <label>{{ t('logging.requestId') }}<input class="rounded-control border border-edge-input-default bg-fill-input-default text-pen-input-default focus-visible:outline-focus focus-visible:outline-offset-focus focus-visible:outline-edge-input-focus" v-model="requestId" maxlength="96"></label>

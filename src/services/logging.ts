@@ -612,7 +612,7 @@ export function createLogging<E>(options: Options<E>) {
       if(!Array.isArray(candidates)||candidates.length>limit)return {status:'unavailable' as const,removed,held}
       for(const candidate of candidates){
         if(closing||closed)return {status:'unavailable' as const,removed,held}
-        if(!['request','marker'].includes(candidate.kind)||![candidate.tenantId,candidate.source,candidate.id,candidate.version].every(token))return {status:'unavailable' as const,removed,held}
+        if(!['request','marker','recovery','sink'].includes(candidate.kind)||![candidate.tenantId,candidate.source,candidate.id,candidate.version].every(token))return {status:'unavailable' as const,removed,held}
         const snapshot=Object.freeze({...candidate})
         retirementCursor=snapshot
         if(await options.retirementAuthority.authorise(snapshot)!=='clear'){held++;continue}

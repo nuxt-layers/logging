@@ -119,7 +119,7 @@ export type ExternalIntent = Omit<ExternalObservation,'committedAt'|'evidenceRef
   {kind:'policy';expectedRevision:string;revision:string}
 )
 export type SinkObservation = {tenantId:string;source:string;destination:string;state:'ready'|'degraded';committedAt:string;timeQuality:RecordEntry['timeQuality']}
-export type RetirementCandidate = {kind:'request'|'marker';tenantId:string;source:string;id:string;version:string}
+export type RetirementCandidate = {kind:'request'|'marker'|'recovery'|'sink';tenantId:string;source:string;id:string;version:string}
 export type RetirementAuthority = {authorise(candidate:RetirementCandidate):Promise<'clear'|'held'|'unknown'>}
 export type JournalHealth = {capacity:number;requests:number;markers:number;events:number;reservations:number;pending:number;oldestPendingAt:string|null}
 export type ExportRelease = { tenantId:string; source:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string; count:number }
@@ -416,7 +416,9 @@ The retained-record health response includes destination state inferred from the
 
 ### Bounded delivery recovery
 
-`recoverDelivery(event,request)` accepts a single scoped record, destination, request identity and mode. It requires durable recovery ports, verified Clock, distinct `logging.delivery.retry` or `logging.delivery.reconcile` permission, independent approval and clear preservation. Retry is one additional attempt on an explicit recorded refusal, with at most three total attempts, unchanged policy revision and current route; skipped and uncertain writes cannot be retried. The store reserves the request and marks the attempt uncertain before invoking the sink. Reconciliation invokes only the optional evidence provider, never a write. A definitive reconciliation must be supported by a provider evidence reference. No automatic quarantine release is provided. The retry evidence field records the approval reference alongside the sink acknowledgement, not independent provider evidence. Recovery request metadata is capacity bounded and not yet eligible for governed retirement. The retained backlog fields count visible records with missing or non-delivered projections; age is null without verified Clock. This is not a complete provider queue.
+`recoverDelivery(event,request)` accepts a single scoped record, destination, request identity and mode. It requires durable recovery ports, verified Clock, distinct `logging.delivery.retry` or `logging.delivery.reconcile` permission, independent approval and clear preservation. Retry is one additional attempt on an explicit recorded refusal, with at most three total attempts, unchanged policy revision and current route; skipped and uncertain writes cannot be retried. The store reserves the request and marks the attempt uncertain before invoking the sink. Reconciliation invokes only the optional evidence provider, never a write. A definitive reconciliation must be supported by a provider evidence reference. No automatic quarantine release is provided. The retry evidence field records the approval reference alongside the sink acknowledgement, not independent provider evidence. Recovery metadata is capacity bounded. Definitive recovery identities become retirement candidates only after diagnostic removal; pending and uncertain identities remain protected. Sink projections are candidates only after scoped diagnostics and corresponding outbox references are absent. Both require version-specific authority. The retained backlog fields count visible records with missing or non-delivered projections; age is null without verified Clock. This is not a complete provider queue.
+
+The protected HTTP operations `delivery.retry` and `delivery.reconcile` require a matching mode; the delivery screen exposes confirmed, scoped recovery requests. No automatic retry of uncertain deliveries is available.
 
 ## You will hit this
 

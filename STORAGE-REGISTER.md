@@ -17,3 +17,5 @@ The SQLite `logging_sink_state` table stores tenant/source/destination identifie
 Request identities and lifecycle markers now have opaque retirement versions (random 128-bit identifiers); used for compare-and-delete under independent host authority, not personal identifiers or retention periods.
 
 SQLite `logging_delivery_recovery` stores scoped request, record, destination, mode, subject, approval and outcome evidence references and timestamp. Capacity is bounded; governed retirement of recovery metadata is not yet implemented.
+
+Recovery metadata and sink projections now carry opaque retirement versions. Definitive recovery identities are eligible only after record removal; unresolved identities remain protected. Sink projection retirement requires no scoped diagnostics or matching outbox references and independent authority.
