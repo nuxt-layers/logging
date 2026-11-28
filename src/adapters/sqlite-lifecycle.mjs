@@ -27,6 +27,11 @@ export function createSqliteLifecycleJournal(path, capacity = 100000) {
         tenant TEXT NOT NULL, source TEXT NOT NULL, request TEXT NOT NULL,
         fingerprint TEXT NOT NULL, PRIMARY KEY(tenant,source,request)
       );
+      CREATE TABLE IF NOT EXISTS logging_sink_state (
+        tenant TEXT NOT NULL, source TEXT NOT NULL, destination TEXT NOT NULL,
+        state TEXT NOT NULL, observed_at TEXT NOT NULL,
+        PRIMARY KEY(tenant,source,destination)
+      );
       CREATE TABLE IF NOT EXISTS logging_outbox (
         seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, payload TEXT NOT NULL,
         acknowledged INTEGER NOT NULL DEFAULT 0 CHECK(acknowledged IN (0,1))
@@ -57,6 +62,27 @@ export function createSqliteLifecycleJournal(path, capacity = 100000) {
   return {
     async health() {
       return {capacity,requests:requestCount.get().n,markers:markerCount.get().n,events:eventCount.get().n,reservations:reservations.get().n,pending:pendingCount.get().n,oldestPendingAt:oldestPending.get()?.stamp??null}
+    },
+    async observeSink(observation) {
+      const {tenantId,source,destination,state,committedAt,timeQuality}=observation
+      if(![tenantId,source,destination].every(v=>typeof v==='string'&&/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$/.test(v))||
+         !['ready','degraded'].includes(state)||!['verified','degraded','unknown'].includes(timeQuality)||
+         !Number.isFinite(Date.parse(committedAt)))return 'uncertain'
+      try {
+        db.exec('BEGIN IMMEDIATE')
+        const previous=db.prepare('SELECT state,observed_at FROM logging_sink_state WHERE tenant=? AND source=? AND destination=?').get(tenantId,source,destination)
+        if(previous&&Date.parse(previous.observed_at)>Date.parse(committedAt)){db.exec('ROLLBACK');return 'uncertain'}
+        const transition=previous?previous.state!==state:state==='degraded'
+        if((!previous&&db.prepare('SELECT COUNT(*) AS n FROM logging_sink_state').get().n>=capacity)||(transition&&eventFull())){
+          db.exec('ROLLBACK');return 'full'
+        }
+        db.prepare('INSERT INTO logging_sink_state VALUES(?,?,?,?,?) ON CONFLICT(tenant,source,destination) DO UPDATE SET state=excluded.state,observed_at=excluded.observed_at').run(tenantId,source,destination,state,committedAt)
+        if(transition){
+          const event={version:1,id:randomUUID(),type:state==='degraded'?'logging.sink.degraded':'logging.sink.recovered',tenantId,source,destination,state,committedAt,timeQuality}
+          insertEvent.run(event.id,JSON.stringify(event))
+        }
+        db.exec('COMMIT');return transition?'committed':'unchanged'
+      }catch{try{db.exec('ROLLBACK')}catch{}return 'uncertain'}
     },
     async reserveExternal(intent) {
       const {tenantId,source,requestId,subjectId}=intent

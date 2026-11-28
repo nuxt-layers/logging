@@ -135,3 +135,19 @@ test('external reservation survives reopen and reserves confirmation capacity',a
   assert.equal(await journal.reserveExternal!(intent),'conflict')
  }finally{journal.close();rmSync(dir,{recursive:true,force:true})}
 })
+
+test('sink transitions are scoped, durable, deduplicated and capacity bounded',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'logging-sink-state-'))
+ const path=join(dir,'journal.sqlite')
+ let journal=createSqliteLifecycleJournal(path,2)
+ const observation={tenantId:'a',source:'worker',destination:'local',state:'degraded' as const,committedAt:command.committedAt,timeQuality:'verified' as const}
+ try{
+  assert.equal(await journal.observeSink!(observation),'committed')
+  journal.close();journal=createSqliteLifecycleJournal(path,2)
+  assert.equal(await journal.observeSink!(observation),'unchanged')
+  assert.equal(await journal.observeSink!({...observation,state:'ready',committedAt:'2026-11-27T00:00:00Z'}),'committed')
+  assert.equal(await journal.observeSink!(observation),'uncertain')
+  assert.equal(await journal.observeSink!({...observation,tenantId:'b'}),'full')
+  assert.deepEqual((await journal.pending(10)).map(e=>e.type),['logging.sink.degraded','logging.sink.recovered'])
+ }finally{journal.close();rmSync(dir,{recursive:true,force:true})}
+})
