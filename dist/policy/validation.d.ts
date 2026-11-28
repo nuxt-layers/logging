@@ -1,0 +1,11 @@
+import type { Rule, Diagnostic, Severity } from '../contracts/types.ts';
+export declare const token: (v: unknown) => v is string;
+export declare const instant: (v: unknown) => v is string;
+export declare const levels: readonly Severity[];
+export declare const bounded: (v: number, max: number) => boolean;
+export declare function compileRules(input: readonly Rule[], targets: Set<string>): Map<string, Rule>;
+export declare function effectiveRules(floors: Map<string, Rule>, input: readonly Rule[], source: string, targets: Set<string>): Rule[];
+export declare function plain(v: unknown): v is Record<string, unknown>;
+export declare function fields(v: Record<string, unknown>, allow: readonly string[]): boolean;
+export declare function diagnosticCode(input: unknown): string | null;
+export declare function validateDiagnostic(input: unknown, rule: Rule): Diagnostic | null;

@@ -23,6 +23,7 @@ jobs:
       - run: npm exec --yes --package=corepack@0.36.0 -- corepack pnpm install --frozen-lockfile
       - run: npm exec --yes --package=corepack@0.36.0 -- corepack pnpm typecheck
       - run: npm exec --yes --package=corepack@0.36.0 -- corepack pnpm test
+      - run: git diff --exit-code -- dist
       - run: node scripts/check-contract.mjs
       - run: node scripts/check-composition.mjs
       - name: Test isolated packaged consumer
@@ -30,6 +31,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/logging-consumer/node_modules/@nuxt-layers/logging"
           git archive HEAD | tar -x -C "$RUNNER_TEMP/logging-consumer/node_modules/@nuxt-layers/logging"
+          test -f "$RUNNER_TEMP/logging-consumer/node_modules/@nuxt-layers/logging/dist/index.js"
           cp tests/integration/consumer.test.ts "$RUNNER_TEMP/logging-consumer/consumer.test.ts"
           cd "$RUNNER_TEMP/logging-consumer"
           node --test consumer.test.ts

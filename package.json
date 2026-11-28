@@ -9,17 +9,24 @@
   "packageManager": "pnpm@12.16.1",
   "exports": {
     ".": {
-      "types": "./src/index.ts",
-      "default": "./src/index.ts"
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
     },
     "./nuxt": "./nuxt.config.ts",
-    "./nuxt/server": "./server/utils/logging.ts"
+    "./nuxt/server": "./server/utils/logging.ts",
+    "./sqlite": {
+      "types": "./src/adapters/sqlite-lifecycle.d.mts",
+      "default": "./src/adapters/sqlite-lifecycle.mjs"
+    },
+    "./messages/en-GB": "./i18n/locales/en-GB.json",
+    "./presentation-source": "./app/components/LoggingAdminPanel.vue"
   },
   "scripts": {
-    "test": "node --test tests/unit/*.test.ts tests/integration/*.test.ts",
+    "test": "pnpm run build && node --test tests/unit/*.test.ts tests/integration/*.test.ts",
     "typecheck": "tsc --noEmit",
     "check:contract": "node scripts/check-contract.mjs",
-    "check:composition": "node scripts/check-composition.mjs"
+    "check:composition": "node scripts/check-composition.mjs",
+    "build": "tsc -p tsconfig.build.json"
   },
   "devDependencies": {
     "typescript": "6.0.3"
