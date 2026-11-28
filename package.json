@@ -17,7 +17,9 @@
     "./sqlite": {
       "types": "./src/adapters/sqlite-lifecycle.d.mts",
       "default": "./src/adapters/sqlite-lifecycle.mjs"
-    }
+    },
+    "./messages/en-GB": "./i18n/locales/en-GB.json",
+    "./presentation-source": "./app/components/LoggingAdminPanel.vue"
   },
   "scripts": {
     "test": "node --test tests/unit/*.test.ts tests/integration/*.test.ts",
