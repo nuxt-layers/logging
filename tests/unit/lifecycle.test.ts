@@ -92,3 +92,13 @@ test('policy permission receives expected and proposed revision and request iden
  assert.equal((await service.changePolicy(event,{tenantId:'a',source:'worker',expectedRevision:'v1',requestId:'denied',policy:{revision:'v2',rules:[]}})).status,'rejected')
  assert.equal((await service.changePolicy(event,{tenantId:'a',source:'worker',expectedRevision:'v1',requestId:'req',policy:{revision:'v2',rules:[]}})).status,'committed')
 })
+
+test('durable export fails closed unless release is committed',async()=>{
+ for(const outcome of ['committed','conflict','uncertain'] as const){
+  const service=setup({approveLifecycle:clear,lifecycleJournal:{commit:async()=> 'committed',visibility:async()=> 'visible',pending:async()=>[],acknowledge:async()=>{},recordExportRelease:async()=>outcome}})
+  await service.submit(event,diagnostic)
+  const result=await service.exportDiagnostics(event,q,'req')
+  assert.equal(result.status,outcome==='committed'?'completed-local':outcome==='conflict'?'rejected':'uncertain')
+  assert.equal(result.records.length,outcome==='committed'?1:0)
+ }
+})

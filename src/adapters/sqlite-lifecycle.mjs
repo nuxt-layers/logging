@@ -114,6 +114,19 @@ export function createSqliteLifecycleJournal(path) {
         return 'uncertain'
       }
     },
+    async recordExportRelease(release) {
+      const {tenantId,source,requestId,subjectId,evidenceRef,committedAt,count}=release
+      if(!Number.isSafeInteger(count)||count<0||count>100||!Number.isFinite(Date.parse(committedAt)))return 'conflict'
+      try {
+        db.exec('BEGIN IMMEDIATE')
+        if(lookup.get(tenantId,source,requestId)){db.exec('ROLLBACK');return 'conflict'}
+        const event={version:1,id:randomUUID(),type:'logging.export.released',tenantId,source,requestId,subjectId,evidenceRef,committedAt,count}
+        insertRequest.run(tenantId,source,requestId,JSON.stringify(['export',subjectId,evidenceRef]))
+        insertEvent.run(event.id,JSON.stringify(event))
+        db.exec('COMMIT')
+        return 'committed'
+      } catch {try{db.exec('ROLLBACK')}catch{}return 'uncertain'}
+    },
     async visibility({tenantId,source,id}) {
       return state.get(tenantId,source,id)?.state??'visible'
     },

@@ -234,6 +234,16 @@ export function createLogging<E>(options: Options<E>) {
       expire(time().ms)
       const offset=q.offset??0
       const records=(await visibleEntries(q)).slice(offset,offset+q.limit).map(x=>x.record)
+      if(journal) {
+        if(!journal.recordExportRelease)return {status:'unavailable',records:[]}
+        if(closing||closed)return {status:'unavailable',records:[]}
+        let outcome
+        try {outcome=await journal.recordExportRelease({tenantId:q.tenantId,source:q.source,requestId,subjectId:caller.subjectId!,evidenceRef:approval.evidenceRef,committedAt:time().instant,count:records.length})}
+        catch {outcome='uncertain'}
+        if(outcome==='conflict')return {status:'rejected',records:[]}
+        if(outcome!=='committed'){close();return {status:'uncertain',records:[]}}
+        if(closing||closed)return {status:'unavailable',records:[]}
+      }
       return {status:'completed-local',requestId,evidenceRef:approval.evidenceRef,records,coverage:store?'durable diagnostic projection only; no provider export':'process-local only; incomplete; no provider export'}
     } catch {return {status:'unavailable',records:[]}}
     finally {endLifecycle()}

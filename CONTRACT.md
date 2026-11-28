@@ -104,7 +104,10 @@ export type LifecycleEvent = Readonly<{
   recordId:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string
 }> | Readonly<{
   version:1; id:string; type:'logging.expired'; tenantId:string; source:string; recordId:string; committedAt:string
+}> | Readonly<{
+  version:1; id:string; type:'logging.export.released'; tenantId:string; source:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string; count:number
 }>
+export type ExportRelease = { tenantId:string; source:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string; count:number }
 export type LifecycleCommit = {
   action:'restrict'|'erase'; target:LifecycleTarget; requestId:string; subjectId:string;
   evidenceRef:string; committedAt:string
@@ -132,6 +135,7 @@ export type JournalRetentionAuthority = {
 }
 export type LifecycleJournal = {
   commit(command:LifecycleCommit):Promise<'committed'|'duplicate'|'conflict'|'uncertain'>
+  recordExportRelease?(release:ExportRelease):Promise<'committed'|'conflict'|'uncertain'>
   visibility(target:LifecycleTarget):Promise<'visible'|'restricted'|'erased'>
   pending(limit:number):Promise<LifecycleEvent[]>
   acknowledge(eventId:string,acknowledgedAt?:string):Promise<void>
@@ -356,6 +360,8 @@ In one host Nitro plugin, import provideLogging, getLogging and closeLogging fro
 POST /api/logging/operation accepts JSON {operation,input,requestId?}; requires exact configured Origin, application/json, x-logging-request: 1, bounded Content-Length (1–32768 bytes), no chunked body. Host ingress must enforce matching body and request-rate limits and same-origin session/CSRF rules. Operations records/delivery/health/policy/export/erase/restrict/provider/policy.change map exactly to the documented service calls. All use trusted server-side caller resolution and separate permissions; no browser submit or composition-root operation. Malformed requests return safe HTTP errors; service outcomes are returned as typed results, not translated into success claims. Disabled/uncomposed service fails closed. No cache or referrer; host must enforce CSP frame-ancestors and TLS. Browser data is transient and cleared on scope edit; no browser storage or download persistence added.
 
 ## Headless surface
+
+With a durable journal, protected export requires the journal to commit a minimised `logging.export.released` event and unique scoped request identity before returning records. The event records authorisation to release a bounded snapshot, not receipt by the client, and excludes diagnostic contents. Repeated request identities reject; use a new independently approved request for another export. A journal without this optional port cannot release protected exports. Process-local exports remain non-durable.
 
 Durable retention expiry emits `logging.expired` atomically with removal; the maintenance event has no fabricated operator or approval evidence. The store must implement this atomic guarantee. Process-local expiry is not a durable event. External authority commits are not claimed as local atomic commits.
 

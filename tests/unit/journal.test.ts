@@ -69,3 +69,19 @@ test('expiry commits its event once and survives reopening',async()=>{
   assert.equal(events[0]?.recordId,'record')
  } finally {journal.close();rmSync(dir,{recursive:true,force:true})}
 })
+
+test('protected export release is durable, minimised and cannot be repeated under the same request',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'logging-export-'))
+ const path=join(dir,'journal.sqlite')
+ let journal=createSqliteLifecycleJournal(path)
+ try {
+  const release={tenantId:'a',source:'worker',requestId:'export-1',subjectId:'operator',evidenceRef:'evidence',committedAt:command.committedAt,count:1}
+  assert.equal(await journal.recordExportRelease!(release),'committed')
+  journal.close();journal=createSqliteLifecycleJournal(path)
+  assert.equal(await journal.recordExportRelease!(release),'conflict')
+  assert.equal(await journal.commit({...command,requestId:release.requestId}),'conflict')
+  const events=await journal.pending(10)
+  assert.equal(events.length,1)
+  assert.deepEqual(events[0],{version:1,id:events[0]!.id,type:'logging.export.released',...release})
+ } finally {journal.close();rmSync(dir,{recursive:true,force:true})}
+})

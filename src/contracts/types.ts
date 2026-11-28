@@ -34,7 +34,10 @@ export type LifecycleEvent = Readonly<{
   recordId:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string
 }> | Readonly<{
   version:1; id:string; type:'logging.expired'; tenantId:string; source:string; recordId:string; committedAt:string
+}> | Readonly<{
+  version:1; id:string; type:'logging.export.released'; tenantId:string; source:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string; count:number
 }>
+export type ExportRelease = { tenantId:string; source:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string; count:number }
 export type LifecycleCommit = {
   action:'restrict'|'erase'; target:LifecycleTarget; requestId:string; subjectId:string;
   evidenceRef:string; committedAt:string
@@ -62,6 +65,7 @@ export type JournalRetentionAuthority = {
 }
 export type LifecycleJournal = {
   commit(command:LifecycleCommit):Promise<'committed'|'duplicate'|'conflict'|'uncertain'>
+  recordExportRelease?(release:ExportRelease):Promise<'committed'|'conflict'|'uncertain'>
   visibility(target:LifecycleTarget):Promise<'visible'|'restricted'|'erased'>
   pending(limit:number):Promise<LifecycleEvent[]>
   acknowledge(eventId:string,acknowledgedAt?:string):Promise<void>
