@@ -27,6 +27,13 @@ export function createSqliteLifecycleJournal(path, capacity = 100000) {
         tenant TEXT NOT NULL, source TEXT NOT NULL, request TEXT NOT NULL,
         fingerprint TEXT NOT NULL, PRIMARY KEY(tenant,source,request)
       );
+      CREATE TABLE IF NOT EXISTS logging_delivery_recovery (
+        tenant TEXT NOT NULL, source TEXT NOT NULL, request TEXT NOT NULL,
+        record TEXT NOT NULL, destination TEXT NOT NULL, mode TEXT NOT NULL,
+        subject TEXT NOT NULL, approval TEXT NOT NULL, state TEXT NOT NULL,
+        evidence TEXT, stamp TEXT NOT NULL,
+        PRIMARY KEY(tenant,source,request)
+      );
       CREATE TABLE IF NOT EXISTS logging_sink_state (
         tenant TEXT NOT NULL, source TEXT NOT NULL, destination TEXT NOT NULL,
         state TEXT NOT NULL, observed_at TEXT NOT NULL,
@@ -153,6 +160,53 @@ export function createSqliteLifecycleJournal(path, capacity = 100000) {
       return db.prepare(`SELECT d.payload,d.delivery FROM logging_diagnostics d
         LEFT JOIN logging_lifecycle l ON d.tenant=l.tenant AND d.source=l.source AND d.record=l.record
         WHERE d.tenant=? AND d.source=? AND l.state IS NULL ORDER BY d.receipt,d.record LIMIT ?`).all(tenantId,source,limit).map(row=>({record:JSON.parse(row.payload),delivery:JSON.parse(row.delivery)}))
+    },
+    async reserveDeliveryRecovery(request,expected,subjectId,evidenceRef,stamp) {
+      const {target,destination,requestId,mode}=request
+      const {tenantId,source,id}=target
+      try {
+        db.exec('BEGIN IMMEDIATE')
+        const previous=lookup.get(tenantId,source,requestId)
+        const recovery=db.prepare('SELECT 1 FROM logging_delivery_recovery WHERE tenant=? AND source=? AND request=?').get(tenantId,source,requestId)
+        const row=db.prepare('SELECT delivery FROM logging_diagnostics WHERE tenant=? AND source=? AND record=?').get(tenantId,source,id)
+        const current=row?JSON.parse(row.delivery).find(d=>d.target===destination):undefined
+        const eligible=current&&current.status===expected.status&&current.attempts===expected.attempts&&current.time===expected.time&&
+          (mode==='retry'?current.status==='exhausted'&&current.attempts>0&&current.attempts<3:mode==='reconcile'&&current.status==='uncertain')
+        const pending=db.prepare("SELECT 1 FROM logging_delivery_recovery WHERE tenant=? AND source=? AND record=? AND destination=? AND state='pending'").get(tenantId,source,id,destination)
+        if(previous||recovery||!eligible||state.get(tenantId,source,id)||(mode==='retry'&&pending)){
+          db.exec('ROLLBACK');return 'blocked'
+        }
+        if(db.prepare('SELECT COUNT(*) AS n FROM logging_delivery_recovery').get().n>=capacity){db.exec('ROLLBACK');return 'full'}
+        db.prepare('INSERT INTO logging_delivery_recovery VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(tenantId,source,requestId,id,destination,mode,subjectId,evidenceRef,'pending',null,stamp)
+        // Reserve before the external call. A crash can never make this a definite refusal.
+        if(mode==='retry'){
+          const delivery=JSON.parse(row.delivery).map(d=>d.target===destination?{...d,status:'uncertain',attempts:d.attempts+1,time:stamp}:d)
+          db.prepare('UPDATE logging_diagnostics SET delivery=? WHERE tenant=? AND source=? AND record=?').run(JSON.stringify(delivery),tenantId,source,id)
+        }
+        db.exec('COMMIT');return 'reserved'
+      }catch{try{db.exec('ROLLBACK')}catch{}return 'uncertain'}
+    },
+    async finishDeliveryRecovery(request,result,stamp) {
+      const {target,destination,requestId,mode}=request
+      const {tenantId,source,id}=target
+      try {
+        db.exec('BEGIN IMMEDIATE')
+        const reserved=db.prepare("SELECT * FROM logging_delivery_recovery WHERE tenant=? AND source=? AND request=? AND state='pending'").get(tenantId,source,requestId)
+        const row=db.prepare('SELECT delivery FROM logging_diagnostics WHERE tenant=? AND source=? AND record=?').get(tenantId,source,id)
+        if(!reserved||reserved.record!==id||reserved.destination!==destination||reserved.mode!==mode||!row||state.get(tenantId,source,id)){
+          db.exec('ROLLBACK');return 'uncertain'
+        }
+        const delivery=JSON.parse(row.delivery)
+        const current=delivery.find(d=>d.target===destination)
+        if(!current||current.status!=='uncertain'){db.exec('ROLLBACK');return 'uncertain'}
+        const status=result.status==='refused'?'exhausted':result.status
+        db.prepare('UPDATE logging_diagnostics SET delivery=? WHERE tenant=? AND source=? AND record=?').run(JSON.stringify(delivery.map(d=>d.target===destination?{...d,status,time:stamp}:d)),tenantId,source,id)
+        db.prepare('UPDATE logging_delivery_recovery SET state=?,evidence=?,stamp=? WHERE tenant=? AND source=? AND request=?').run(result.status,result.evidenceRef??null,stamp,tenantId,source,requestId)
+        if(mode==='reconcile'&&result.status!=='uncertain'){
+          db.prepare("UPDATE logging_delivery_recovery SET state=?,evidence=?,stamp=? WHERE tenant=? AND source=? AND record=? AND destination=? AND state='pending'").run(result.status,result.evidenceRef,stamp,tenantId,source,id,destination)
+        }
+        db.exec('COMMIT');return 'committed'
+      }catch{try{db.exec('ROLLBACK')}catch{}return 'uncertain'}
     },
     async updateDelivery(target,delivery) {
       db.prepare('UPDATE logging_diagnostics SET delivery=? WHERE tenant=? AND source=? AND record=?').run(JSON.stringify(delivery),target.tenantId,target.source,target.id)

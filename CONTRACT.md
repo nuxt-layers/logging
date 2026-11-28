@@ -81,7 +81,10 @@ export type DiagnosticQuery = { tenantId:string; source:string; from:string; to:
 export type Policy = { revision:string; rules:readonly Rule[] }
 export type ExternalSink = { id:string; sink:Sink; maxAttempts?:number }
 export type DeliveryState = { target:string; status:'delivered'|'exhausted'|'uncertain'; attempts:number; time:string }
-export type LifecycleAction = 'export' | 'erase' | 'restrict' | 'recover' | 'policy.change'
+export type DeliveryRecoveryRequest = {target:LifecycleTarget;destination:string;requestId:string;mode:'retry'|'reconcile'}
+export type DeliveryRecoveryResult = {status:'delivered'|'refused'|'uncertain'|'blocked'|'rejected'|'unavailable'}
+export type DeliveryRecoveryEvidence = {status:'delivered'|'refused';evidenceRef:string}|{status:'uncertain'}
+export type LifecycleAction = 'export' | 'erase' | 'restrict' | 'recover' | 'policy.change' | 'delivery.retry' | 'delivery.reconcile'
 export type LifecycleTarget = { tenantId:string; source:string; id:string }
 export type LifecycleApproval = {
   action:LifecycleAction
@@ -126,6 +129,8 @@ export type LifecycleCommit = {
 }
 export type StoredDiagnostic = { record:RecordEntry; delivery:DeliveryState[] }
 export type DiagnosticStore = LifecycleJournal & {
+  reserveDeliveryRecovery?(request:DeliveryRecoveryRequest,expected:DeliveryState,subjectId:string,evidenceRef:string,stamp:string):Promise<'reserved'|'blocked'|'full'|'uncertain'>
+  finishDeliveryRecovery?(request:DeliveryRecoveryRequest,result:DeliveryRecoveryEvidence,stamp:string):Promise<'committed'|'uncertain'>
   save(entry:StoredDiagnostic,capacity:number):Promise<'stored'|'full'|'uncertain'>
   load(tenantId:string,source:string,limit:number):Promise<StoredDiagnostic[]>
   updateDelivery(target:LifecycleTarget,delivery:DeliveryState[]):Promise<void>
@@ -189,6 +194,7 @@ export type Options<E> = {
   retentionAuthority?: OptionsRetention
   journalRetention?: JournalRetentionAuthority
   retirementAuthority?: RetirementAuthority
+  reconcileDelivery?: (request:Readonly<DeliveryRecoveryRequest>,signal:AbortSignal)=>Promise<DeliveryRecoveryEvidence>
   providerLifecycle?: (request:ProviderLifecycleRequest,signal:AbortSignal)=>Promise<ProviderLifecycleResult>
   commitPolicy?: (change:PolicyChange,caller:Caller,approvalEvidenceRef:string)=>Promise<PolicyChangeResult>
   approveLifecycle?: (request:LifecycleApproval) => Promise<LifecycleDecision>
@@ -407,6 +413,10 @@ The composition-root-only `maintainRetirement(limit=20)` requires a durable diag
 ### Qualified health and administration
 
 The retained-record health response includes destination state inferred from the most recent matching visible delivery, not a live provider probe. `scopeIntake` requires the separate `logging.health.scope.read` permission against tenant/source without query filters. It contains bounded process-lifetime receipt counts, not counts for the selected period. Missing counters are null; unauthorised or busy submissions are excluded. `scopeIntakeCoverage` qualifies omissions. The administration overview presents labelled counts and qualified outcomes; technical JSON is available in an expandable disclosure. No backlog completeness or provider availability is inferred.
+
+### Bounded delivery recovery
+
+`recoverDelivery(event,request)` accepts a single scoped record, destination, request identity and mode. It requires durable recovery ports, verified Clock, distinct `logging.delivery.retry` or `logging.delivery.reconcile` permission, independent approval and clear preservation. Retry is one additional attempt on an explicit recorded refusal, with at most three total attempts, unchanged policy revision and current route; skipped and uncertain writes cannot be retried. The store reserves the request and marks the attempt uncertain before invoking the sink. Reconciliation invokes only the optional evidence provider, never a write. A definitive reconciliation must be supported by a provider evidence reference. No automatic quarantine release is provided. The retry evidence field records the approval reference alongside the sink acknowledgement, not independent provider evidence. Recovery request metadata is capacity bounded and not yet eligible for governed retirement. The retained backlog fields count visible records with missing or non-delivered projections; age is null without verified Clock. This is not a complete provider queue.
 
 ## You will hit this
 

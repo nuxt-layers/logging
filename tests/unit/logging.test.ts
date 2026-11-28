@@ -147,3 +147,15 @@ test('scope intake counters require independent permission and exclude other ten
  const restricted=await denied.readPipelineHealth(event,q)
  if(restricted.status==='completed')assert.equal(restricted.scopeIntake,null)
 })
+
+test('retained backlog is qualified and uses Clock quality for age',async()=>{
+ const service=setup({rules:[{source:'worker',code:'worker.done',purpose:'diagnostics',attributes:['latency'],destinations:['remote']}],externalSinks:[{id:'remote',sink:{write:async()=> 'refused'}}]})
+ await service.submit(event,diagnostic)
+ const result=await service.readPipelineHealth(event,{tenantId:'a',source:'worker',from:stamp,to:stamp,limit:10})
+ assert.equal(result.status,'completed')
+ if(result.status==='completed'){
+  assert.equal(result.backlogRecords,1)
+  assert.equal(result.oldestBacklogAt,stamp)
+  assert.equal(result.oldestBacklogAgeMs,null)
+ }
+})

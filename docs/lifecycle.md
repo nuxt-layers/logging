@@ -29,3 +29,5 @@ Current completion candidate: SQLite capacity bounds metadata rows and reserved 
 The SQLite journal records scoped destination observations and atomically emits degradation and recovery transitions. Initial ready observations do not imply recovery. Repeated states do not emit duplicate transitions; older observations are uncertain. Capacity exhaustion prevents the transition from committing. The adapter alone does not establish service-level observation coverage.
 
 Governed retirement is distinct from event compaction. The durable store selects bounded candidates, the host supplies a positive version-specific retirement decision, and SQLite atomically rechecks references and version. Pending reservations cannot retire. Marker removal requires no retained diagnostic or outstanding scoped request. The host must exclude replay and stale writers; no default legal or retention authority is assumed.
+
+Manual delivery recovery uses a durable pre-call reservation and bounded explicit-refusal retry. Uncertain outcomes can only be reconciled through qualified evidence, never automatically replayed. Retained backlog counts are not provider queue depth.

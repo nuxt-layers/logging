@@ -15,3 +15,5 @@ SQLite journal metadata capacity defaults to 100000 rows per category (request i
 The SQLite `logging_sink_state` table stores tenant/source/destination identifiers, last observed state and observation timestamp. Cardinality is bounded by journal capacity. No diagnostic payload or credentials are stored in this table. Governed retirement of these projections remains outstanding.
 
 Request identities and lifecycle markers now have opaque retirement versions (random 128-bit identifiers); used for compare-and-delete under independent host authority, not personal identifiers or retention periods.
+
+SQLite `logging_delivery_recovery` stores scoped request, record, destination, mode, subject, approval and outcome evidence references and timestamp. Capacity is bounded; governed retirement of recovery metadata is not yet implemented.
