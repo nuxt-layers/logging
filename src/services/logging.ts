@@ -1,4 +1,4 @@
-import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision, LifecyclePublisher, ProviderLifecycleRequest, ProviderLifecycleResult, PolicyChange, PolicyChangeResult, AccessResource, ExternalObservation, ExternalIntent } from '../contracts/types.ts'
+import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision, LifecyclePublisher, ProviderLifecycleRequest, ProviderLifecycleResult, PolicyChange, PolicyChangeResult, AccessResource, ExternalObservation, ExternalIntent, RetirementCandidate } from '../contracts/types.ts'
 import { token, instant, bounded, levels, compileRules, effectiveRules, validateDiagnostic, diagnosticCode, plain, fields } from '../policy/validation.ts'
 import { deliver } from '../sinks/delivery.ts'
 
@@ -16,6 +16,8 @@ export function createLogging<E>(options: Options<E>) {
   const journal = store ?? options.lifecycleJournal
   let relayBusy=false
   let journalCursor:string|undefined
+  let retirementCursor:RetirementCandidate|undefined
+  let sinkObservationFailures=0
   const journalRetention=options.journalRetention?{...options.journalRetention}:undefined
   if(journalRetention&&(!journal?.maintenance||!bounded(journalRetention.retentionMs,3650*86400000)||typeof journalRetention.resolvePreservation!=='function'))throw new Error('LOG_INVALID_CONFIG')
   if (!bounded(capacity,10000) || !bounded(rate,10000) || !bounded(timeout,30000) || !bounded(retention,86400000*30) || !token(revision) || !localSink || typeof localSink.write !== 'function') throw new Error('LOG_INVALID_CONFIG')
@@ -79,6 +81,15 @@ export function createLogging<E>(options: Options<E>) {
     if(!p || !token(p.revision)) return null
     return {revision:p.revision,rules:effectiveRules(floors,p.rules,source,new Set(external.keys()))}
   }
+  async function observeSink(record:RecordEntry,destination:string,state:'ready'|'degraded') {
+    if(!journal?.observeSink)return
+    try {
+      const stamp=time()
+      const result=await journal.observeSink({tenantId:record.tenantId,source:record.source,destination,state,committedAt:stamp.instant,timeQuality:stamp.quality})
+      if(result==='committed'||result==='unchanged')return
+    }catch{}
+    sinkObservationFailures=Math.min(Number.MAX_SAFE_INTEGER,sinkObservationFailures+1)
+  }
   async function perform(event:E,input:Diagnostic):Promise<Receipt> {
     try {
       const producer=await options.resolveProducer(event)
@@ -114,23 +125,25 @@ export function createLogging<E>(options: Options<E>) {
       activeAbort=controller
       const local=await deliver(localSink,row,timeout,1,controller.signal)
       lastDelivery=local.outcome
-      const localState:DeliveryState={target:'local',status:local.outcome==='refused'?'exhausted':local.outcome,attempts:local.attempts,time:local.time}
+      const localState:DeliveryState={target:'local',status:local.outcome==='refused'?'exhausted':local.outcome,attempts:local.attempts,time:time().instant}
       if(store) {
         try {await store.updateDelivery({tenantId:row.tenantId,source:row.source,id:row.id},[localState])}
         catch {close();return {status:'uncertain',code:'LOG_STORE_UNCERTAIN',id:row.id}}
       }
+      await observeSink(row,'local',local.outcome==='delivered'?'ready':'degraded')
       if(local.outcome==='refused') {drops++;return {status:'unavailable',code:'LOG_SINK_REFUSED'}}
       if(local.outcome!=='delivered') {uncertain++;closed=true;return {status:'uncertain',code:'LOG_SINK_UNCERTAIN',id:row.id}}
-      const item={record:row,restricted:false,delivery:[{target:'local',status:'delivered' as const,attempts:local.attempts,time:local.time}] as DeliveryState[]}
+      const item={record:row,restricted:false,delivery:[{target:'local',status:'delivered' as const,attempts:local.attempts,time:localState.time}] as DeliveryState[]}
       if(!store && !closing && !closed) rows.push(item)
       for(const target of rule.destinations??[]) {
         const ext=external.get(target)
         if(!ext || quarantined.has(target) || controller.signal.aborted) {
-          item.delivery.push({target,status:'exhausted',attempts:0,time:new Date().toISOString()});drops++;continue
+          item.delivery.push({target,status:'exhausted',attempts:0,time:time().instant});drops++;await observeSink(row,target,'degraded');continue
         }
         const result=await deliver(ext.sink,row,timeout,ext.maxAttempts,controller.signal)
         const status=result.outcome==='refused'?'exhausted':result.outcome
-        item.delivery.push({target,status,attempts:result.attempts,time:result.time})
+        item.delivery.push({target,status,attempts:result.attempts,time:time().instant})
+        await observeSink(row,target,status==='delivered'?'ready':'degraded')
         if(status==='uncertain') {uncertain++;quarantined.add(target)}
         if(status==='exhausted') drops++
       }
@@ -399,8 +412,10 @@ export function createLogging<E>(options: Options<E>) {
       const entries=await visibleEntries(q)
       const delivery=entries.flatMap(x=>x.delivery)
       const withoutDelivery=entries.filter(x=>x.delivery.length===0).length
+      const severityDistribution={debug:0,info:0,warn:0,error:0,fatal:0}
+      for(const entry of entries)severityDistribution[entry.record.severity]++
       await checkRead(event,'logging.health.read',q,generation)
-      return {status:'completed' as const,observedAt:observed.instant,timeQuality:observed.quality,storage:store?'durable' as const:'process-local' as const,withoutDelivery,records:entries.length,delivered:delivery.filter(x=>x.status==='delivered').length,exhausted:delivery.filter(x=>x.status==='exhausted').length,uncertain:delivery.filter(x=>x.status==='uncertain').length,coverage:'retained scoped records only; excludes intake losses, restricted and expired records; pagination ignored' as const}
+      return {status:'completed' as const,observedAt:observed.instant,timeQuality:observed.quality,storage:store?'durable' as const:'process-local' as const,withoutDelivery,severityDistribution,records:entries.length,delivered:delivery.filter(x=>x.status==='delivered').length,exhausted:delivery.filter(x=>x.status==='exhausted').length,uncertain:delivery.filter(x=>x.status==='uncertain').length,coverage:'retained scoped records only; excludes intake losses, restricted and expired records; pagination ignored' as const}
     } catch {return {status:'unavailable' as const}}
   }
   // Deployment-wide durable metadata is deliberately not exposed through tenant HTTP queries.
@@ -495,6 +510,30 @@ export function createLogging<E>(options: Options<E>) {
     } catch {return {status:'uncertain' as const,removed,held}}
     finally {endLifecycle()}
   }
+  // Host authority must establish expiry of replay rights and preservation obligations.
+  async function maintainRetirement(limit=20) {
+    if(!store||!journal?.retirementCandidates||!journal.retire||!options.retirementAuthority||relayBusy||busy||lifecycleBusy||closing||closed||!bounded(limit,100))return {status:'unavailable' as const,removed:0,held:0}
+    beginLifecycle()
+    let removed=0,held=0
+    try {
+      if(time().quality!=='verified')return {status:'unavailable' as const,removed,held}
+      const candidates=await journal.retirementCandidates(limit,retirementCursor)
+      if(!Array.isArray(candidates)||candidates.length>limit)return {status:'unavailable' as const,removed,held}
+      for(const candidate of candidates){
+        if(closing||closed)return {status:'unavailable' as const,removed,held}
+        if(!['request','marker'].includes(candidate.kind)||![candidate.tenantId,candidate.source,candidate.id,candidate.version].every(token))return {status:'unavailable' as const,removed,held}
+        const snapshot=Object.freeze({...candidate})
+        retirementCursor=snapshot
+        if(await options.retirementAuthority.authorise(snapshot)!=='clear'){held++;continue}
+        if(closing||closed||time().quality!=='verified')return {status:'unavailable' as const,removed,held}
+        if(await journal.retire(snapshot)==='removed')removed++
+        else held++
+      }
+      if(candidates.length<limit)retirementCursor=undefined
+      return {status:'completed' as const,removed,held}
+    }catch{return {status:'uncertain' as const,removed,held}}
+    finally{endLifecycle()}
+  }
   function close() {
     closing=true;closed=true;activeAbort?.abort();lifecycleAbort?.abort();relayAbort?.abort();rows.length=0;buckets.clear()
   }
@@ -508,5 +547,5 @@ export function createLogging<E>(options: Options<E>) {
       return await Promise.race([Promise.allSettled(pending).then(()=>({status:'completed' as const})),new Promise<{status:'uncertain'}>(resolve=>{timer=setTimeout(()=>resolve({status:'uncertain'}),timeout)})])
     } finally {if(timer!==undefined)clearTimeout(timer)}
   }
-  return {journalHealth,runProviderLifecycle,changePolicy,maintainJournal,maintainRetention,relayLifecycle,submit,readDiagnostics,readDeliveryState,readEffectivePolicy,readPipelineHealth,exportDiagnostics,eraseDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'erase',target,requestId),restrictDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'restrict',target,requestId),hostHealth:()=>({state:closed||quarantined.size?'degraded' as const:(busy||lifecycleBusy||relayBusy)?'busy' as const:'unknown' as const,lastDelivery,drops,uncertain,buffered:rows.length,intake:{...intake},activeIntake:busy?1:0,activeAgeMs:activeSince===null?null:Math.max(0,performance.now()-activeSince),retainedProcessLocal:rows.length,storage:store?'durable' as const:'process-local' as const,quarantined:[...quarantined]}),close,shutdown}
+  return {maintainRetirement,journalHealth,runProviderLifecycle,changePolicy,maintainJournal,maintainRetention,relayLifecycle,submit,readDiagnostics,readDeliveryState,readEffectivePolicy,readPipelineHealth,exportDiagnostics,eraseDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'erase',target,requestId),restrictDiagnostic:(event:E,target:LifecycleTarget,requestId:string)=>changeLocalRecord(event,'restrict',target,requestId),hostHealth:()=>({state:closed||quarantined.size?'degraded' as const:(busy||lifecycleBusy||relayBusy)?'busy' as const:'unknown' as const,lastDelivery,drops,uncertain,sinkObservationFailures,buffered:rows.length,intake:{...intake},activeIntake:busy?1:0,activeAgeMs:activeSince===null?null:Math.max(0,performance.now()-activeSince),retainedProcessLocal:rows.length,storage:store?'durable' as const:'process-local' as const,quarantined:[...quarantined]}),close,shutdown}
 }

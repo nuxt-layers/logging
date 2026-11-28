@@ -39,12 +39,19 @@ export function createSqliteLifecycleJournal(path, capacity = 100000) {
     `)
     // Additive migration: legacy acknowledgements have unknown time and cannot be compacted.
     if(!db.prepare('PRAGMA table_info(logging_outbox)').all().some(c=>c.name==='acknowledged_at'))db.exec('ALTER TABLE logging_outbox ADD COLUMN acknowledged_at INTEGER')
+    // A fresh opaque version on every insert/update prevents stale retirement approvals.
+    for(const table of ['logging_requests','logging_lifecycle']){
+      if(!db.prepare('PRAGMA table_info('+table+')').all().some(c=>c.name==='retirement_version')){
+        db.exec('ALTER TABLE '+table+" ADD COLUMN retirement_version TEXT NOT NULL DEFAULT ''")
+      }
+      db.exec("UPDATE "+table+" SET retirement_version=lower(hex(randomblob(16))) WHERE retirement_version=''")
+    }
   } catch (error) { db.close(); throw error }
   const lookup = db.prepare('SELECT fingerprint FROM logging_requests WHERE tenant=? AND source=? AND request=?')
-  const insertRequest = db.prepare('INSERT INTO logging_requests VALUES(?,?,?,?)')
-  const mutate = db.prepare(`INSERT INTO logging_lifecycle VALUES(?,?,?,?)
+  const insertRequest = db.prepare('INSERT INTO logging_requests(tenant,source,request,fingerprint,retirement_version) VALUES(?,?,?,?,lower(hex(randomblob(16))))')
+  const mutate = db.prepare(`INSERT INTO logging_lifecycle(tenant,source,record,state,retirement_version) VALUES(?,?,?,?,lower(hex(randomblob(16))))
     ON CONFLICT(tenant,source,record) DO UPDATE SET state=CASE
-    WHEN state='erased' THEN 'erased' ELSE excluded.state END`)
+    WHEN state='erased' THEN 'erased' ELSE excluded.state END, retirement_version=excluded.retirement_version`)
   const state = db.prepare('SELECT state FROM logging_lifecycle WHERE tenant=? AND source=? AND record=?')
   const insertEvent = db.prepare('INSERT INTO logging_outbox(id,payload) VALUES(?,?)')
   const pending = db.prepare('SELECT payload FROM logging_outbox WHERE acknowledged=0 ORDER BY seq LIMIT ?')
@@ -59,7 +66,37 @@ export function createSqliteLifecycleJournal(path, capacity = 100000) {
   const requestFull=()=>requestCount.get().n>=capacity
   const detailOf=x=>x.kind==='provider'?{kind:'provider',action:x.action,recordId:x.recordId,destination:x.destination}:x.kind==='policy'?{kind:'policy',expectedRevision:x.expectedRevision,revision:x.revision}:null
   const reservation=(subjectId,detail)=>JSON.stringify(['external-pending',subjectId,detail])
+  // Conservative eligibility: no retained outbox reference, no unresolved reservation,
+  // and no diagnostic or outstanding request in the marker's scope.
+  const eligible = `
+    SELECT 'request' AS kind,r.tenant AS tenantId,r.source,r.request AS id,r.retirement_version AS version
+    FROM logging_requests r
+    WHERE json_extract(r.fingerprint,'$[0]')!='external-pending'
+      AND NOT EXISTS(SELECT 1 FROM logging_outbox o WHERE json_extract(o.payload,'$.tenantId')=r.tenant AND json_extract(o.payload,'$.source')=r.source AND json_extract(o.payload,'$.requestId')=r.request)
+    UNION ALL
+    SELECT 'marker' AS kind,l.tenant AS tenantId,l.source,l.record AS id,l.retirement_version AS version
+    FROM logging_lifecycle l
+    WHERE NOT EXISTS(SELECT 1 FROM logging_diagnostics d WHERE d.tenant=l.tenant AND d.source=l.source AND d.record=l.record)
+      AND NOT EXISTS(SELECT 1 FROM logging_requests r WHERE r.tenant=l.tenant AND r.source=l.source)
+      AND NOT EXISTS(SELECT 1 FROM logging_outbox o WHERE json_extract(o.payload,'$.tenantId')=l.tenant AND json_extract(o.payload,'$.source')=l.source AND json_extract(o.payload,'$.recordId')=l.record)
+  `
   return {
+    async retirementCandidates(limit,after) {
+      if(!Number.isSafeInteger(limit)||limit<1||limit>100)throw new Error('LOG_INVALID_LIMIT')
+      return db.prepare('SELECT * FROM ('+eligible+') WHERE (kind,tenantId,source,id)>(?,?,?,?) ORDER BY kind,tenantId,source,id LIMIT ?').all(after?.kind??'',after?.tenantId??'',after?.source??'',after?.id??'',limit)
+    },
+    async retire(candidate) {
+      const {kind,tenantId,source,id,version}=candidate
+      if(kind!=='request'&&kind!=='marker')return 'blocked'
+      try {
+        db.exec('BEGIN IMMEDIATE')
+        const current=db.prepare('SELECT * FROM ('+eligible+') WHERE kind=? AND tenantId=? AND source=? AND id=?').get(kind,tenantId,source,id)
+        if(!current||current.version!==version){db.exec('ROLLBACK');return 'blocked'}
+        const sql=kind==='request'?'DELETE FROM logging_requests WHERE tenant=? AND source=? AND request=? AND retirement_version=?':'DELETE FROM logging_lifecycle WHERE tenant=? AND source=? AND record=? AND retirement_version=?'
+        const result=db.prepare(sql).run(tenantId,source,id,version)
+        db.exec('COMMIT');return result.changes?'removed':'absent'
+      }catch(error){try{db.exec('ROLLBACK')}catch{}throw error}
+    },
     async health() {
       return {capacity,requests:requestCount.get().n,markers:markerCount.get().n,events:eventCount.get().n,reservations:reservations.get().n,pending:pendingCount.get().n,oldestPendingAt:oldestPending.get()?.stamp??null}
     },
@@ -182,7 +219,7 @@ export function createSqliteLifecycleJournal(path, capacity = 100000) {
         if(previous&&!reserved){db.exec('ROLLBACK');return previous.fingerprint===fingerprint?'duplicate':'conflict'}
         if(!reserved&&(requestFull()||eventFull())){db.exec('ROLLBACK');return 'full'}
         const event={version:1,id:randomUUID(),type:'logging.external.confirmation.observed',tenantId,source,requestId,subjectId,evidenceRef,committedAt,...detail}
-        if(reserved)db.prepare('UPDATE logging_requests SET fingerprint=? WHERE tenant=? AND source=? AND request=?').run(fingerprint,tenantId,source,requestId)
+        if(reserved)db.prepare('UPDATE logging_requests SET fingerprint=?, retirement_version=lower(hex(randomblob(16))) WHERE tenant=? AND source=? AND request=?').run(fingerprint,tenantId,source,requestId)
         else insertRequest.run(tenantId,source,requestId,fingerprint)
         insertEvent.run(event.id,JSON.stringify(event))
         db.exec('COMMIT')

@@ -118,3 +118,14 @@ test('timeout is uncertain and does not retry',async()=>{
  assert.equal((await service.submit(event,diagnostic)).status,'unavailable')
  assert.equal(calls,1)
 })
+
+test('scoped retained severity distribution and clock-derived delivery time',async()=>{
+ const service=setup()
+ await service.submit(event,diagnostic)
+ const q={tenantId:'a',source:'worker',from:stamp,to:stamp,limit:10}
+ const result=await service.readPipelineHealth(event,q)
+ assert.equal(result.status,'completed')
+ if(result.status==='completed')assert.deepEqual(result.severityDistribution,{debug:0,info:1,warn:0,error:0,fatal:0})
+ assert.equal((await service.readDeliveryState(event,q)).records[0]?.delivery[0]?.time,stamp)
+ assert.equal((await service.readPipelineHealth({...event,tenantId:'b'},q)).status,'rejected')
+})

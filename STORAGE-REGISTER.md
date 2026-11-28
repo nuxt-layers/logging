@@ -13,3 +13,5 @@ Optional governed journal maintenance deletes only aged, acknowledged outbox eve
 SQLite journal metadata capacity defaults to 100000 rows per category (request identities, markers, and events plus reserved event slots), configurable 1–1000000. Existing over-limit data is preserved. Durable external reservations hold scoped identifiers, operation kind and target or policy revisions; pending reservations survive restarts. No automated retirement. Capacity exhaustion blocks new protected work rather than discarding evidence. Physical file/WAL/backup bounds remain host obligations.
 
 The SQLite `logging_sink_state` table stores tenant/source/destination identifiers, last observed state and observation timestamp. Cardinality is bounded by journal capacity. No diagnostic payload or credentials are stored in this table. Governed retirement of these projections remains outstanding.
+
+Request identities and lifecycle markers now have opaque retirement versions (random 128-bit identifiers); used for compare-and-delete under independent host authority, not personal identifiers or retention periods.

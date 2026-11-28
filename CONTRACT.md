@@ -99,7 +99,7 @@ export type LifecycleResult =
 export type ExportResult =
   | { status:'completed-local'; requestId:string; evidenceRef:string; records:RecordEntry[]; coverage:string }
   | { status:'blocked'|'rejected'|'unavailable'|'uncertain'; records:never[] }
-export type LifecycleEvent = Readonly<ExternalObservation & {version:1;id:string;type:'logging.external.confirmation.observed'}> | Readonly<{
+export type LifecycleEvent = Readonly<SinkObservation & {version:1;id:string;type:'logging.sink.degraded'|'logging.sink.recovered'}> | Readonly<ExternalObservation & {version:1;id:string;type:'logging.external.confirmation.observed'}> | Readonly<{
   version:1; id:string; type:'logging.restricted'|'logging.erased'; tenantId:string; source:string;
   recordId:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string
 }> | Readonly<{
@@ -115,6 +115,9 @@ export type ExternalIntent = Omit<ExternalObservation,'committedAt'|'evidenceRef
   {kind:'provider';action:'erase'|'restrict'|'recover';recordId:string;destination:string} |
   {kind:'policy';expectedRevision:string;revision:string}
 )
+export type SinkObservation = {tenantId:string;source:string;destination:string;state:'ready'|'degraded';committedAt:string;timeQuality:RecordEntry['timeQuality']}
+export type RetirementCandidate = {kind:'request'|'marker';tenantId:string;source:string;id:string;version:string}
+export type RetirementAuthority = {authorise(candidate:RetirementCandidate):Promise<'clear'|'held'|'unknown'>}
 export type JournalHealth = {capacity:number;requests:number;markers:number;events:number;reservations:number;pending:number;oldestPendingAt:string|null}
 export type ExportRelease = { tenantId:string; source:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string; count:number }
 export type LifecycleCommit = {
@@ -146,6 +149,9 @@ export type LifecycleJournal = {
   commit(command:LifecycleCommit):Promise<'committed'|'duplicate'|'conflict'|'uncertain'|'full'>
   reserveExternal?(intent:ExternalIntent):Promise<'reserved'|'conflict'|'uncertain'|'full'>
   health?():Promise<JournalHealth>
+  observeSink?(observation:SinkObservation):Promise<'committed'|'unchanged'|'full'|'uncertain'>
+  retirementCandidates?(limit:number,after?:RetirementCandidate):Promise<RetirementCandidate[]>
+  retire?(candidate:RetirementCandidate):Promise<'removed'|'absent'|'blocked'>
   recordExternalObservation?(observation:ExternalObservation):Promise<'committed'|'duplicate'|'conflict'|'uncertain'|'full'>
   recordExportRelease?(release:ExportRelease):Promise<'committed'|'conflict'|'uncertain'|'full'>
   visibility(target:LifecycleTarget):Promise<'visible'|'restricted'|'erased'>
@@ -182,6 +188,7 @@ export type Options<E> = {
   diagnosticStore?: DiagnosticStore
   retentionAuthority?: OptionsRetention
   journalRetention?: JournalRetentionAuthority
+  retirementAuthority?: RetirementAuthority
   providerLifecycle?: (request:ProviderLifecycleRequest,signal:AbortSignal)=>Promise<ProviderLifecycleResult>
   commitPolicy?: (change:PolicyChange,caller:Caller,approvalEvidenceRef:string)=>Promise<PolicyChangeResult>
   approveLifecycle?: (request:LifecycleApproval) => Promise<LifecycleDecision>
@@ -392,6 +399,10 @@ Durable retention expiry emits `logging.expired` atomically with removal; the ma
 Implemented: validated diagnostic admission, sanitised sink output, scoped reads, delivery projection, effective policy projection, scoped retained-record health, protected local export/restriction/erasure, host health and shutdown. These work without a GUI, Nuxt or external destinations. No mandatory database.
 
 Approved but unavailable: provider-wide export, provider hold management, complete scoped loss/backlog health, committed lifecycle events for other operations, automatic replay/reconciliation of uncertain sink writes and manual retry. Do not call invented methods or substitute Logging receipts for Audit evidence. Missing provider contracts must be reconciled before claiming those integrations.
+
+### Governed retirement and sink observations
+
+The composition-root-only `maintainRetirement(limit=20)` requires a durable diagnostic store, verified Clock quality, and a host retirement authority. The authority must establish that preservation obligations and replay rights have ended for the exact versioned candidate, including external copies and stale writers. Missing or unknown authority cannot retire identities. SQLite rechecks eligibility and version in the deletion transaction; retained outbox references, pending external reservations, retained diagnostics and unresolved scoped requests prevent retirement. No retention period is inferred. Sink observations are recorded through the journal when supported; observation failures are counted in composition-root hostHealth, not treated as proof of recovery. Delivery timestamps use the supplied Clock. Scoped health includes severityDistribution for retained visible records only.
 
 ## You will hit this
 
