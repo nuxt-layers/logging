@@ -41,6 +41,11 @@ export type ExternalObservation = {tenantId:string;source:string;requestId:strin
   {kind:'provider';action:'erase'|'restrict'|'recover';recordId:string;destination:string} |
   {kind:'policy';expectedRevision:string;revision:string}
 )
+export type ExternalIntent = Omit<ExternalObservation,'committedAt'|'evidenceRef'|'kind'> & (
+  {kind:'provider';action:'erase'|'restrict'|'recover';recordId:string;destination:string} |
+  {kind:'policy';expectedRevision:string;revision:string}
+)
+export type JournalHealth = {capacity:number;requests:number;markers:number;events:number;reservations:number;pending:number;oldestPendingAt:string|null}
 export type ExportRelease = { tenantId:string; source:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string; count:number }
 export type LifecycleCommit = {
   action:'restrict'|'erase'; target:LifecycleTarget; requestId:string; subjectId:string;
@@ -68,9 +73,11 @@ export type JournalRetentionAuthority = {
   resolvePreservation(event:LifecycleEvent):Promise<PreservationDecision>
 }
 export type LifecycleJournal = {
-  commit(command:LifecycleCommit):Promise<'committed'|'duplicate'|'conflict'|'uncertain'>
-  recordExternalObservation?(observation:ExternalObservation):Promise<'committed'|'duplicate'|'conflict'|'uncertain'>
-  recordExportRelease?(release:ExportRelease):Promise<'committed'|'conflict'|'uncertain'>
+  commit(command:LifecycleCommit):Promise<'committed'|'duplicate'|'conflict'|'uncertain'|'full'>
+  reserveExternal?(intent:ExternalIntent):Promise<'reserved'|'conflict'|'uncertain'|'full'>
+  health?():Promise<JournalHealth>
+  recordExternalObservation?(observation:ExternalObservation):Promise<'committed'|'duplicate'|'conflict'|'uncertain'|'full'>
+  recordExportRelease?(release:ExportRelease):Promise<'committed'|'conflict'|'uncertain'|'full'>
   visibility(target:LifecycleTarget):Promise<'visible'|'restricted'|'erased'>
   pending(limit:number):Promise<LifecycleEvent[]>
   acknowledge(eventId:string,acknowledgedAt?:string):Promise<void>
