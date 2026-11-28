@@ -85,3 +85,20 @@ test('protected export release is durable, minimised and cannot be repeated unde
   assert.deepEqual(events[0],{version:1,id:events[0]!.id,type:'logging.export.released',...release})
  } finally {journal.close();rmSync(dir,{recursive:true,force:true})}
 })
+
+test('external confirmation observation survives reopen and deduplicates',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'logging-observation-'))
+ const path=join(dir,'journal.sqlite')
+ let journal=createSqliteLifecycleJournal(path)
+ const observation={kind:'provider' as const,action:'erase' as const,recordId:'record',destination:'local',tenantId:'a',source:'worker',requestId:'external-1',subjectId:'operator',evidenceRef:'ref',committedAt:command.committedAt}
+ try {
+  assert.equal(await journal.recordExternalObservation!(observation),'committed')
+  journal.close();journal=createSqliteLifecycleJournal(path)
+  assert.equal(await journal.recordExternalObservation!(observation),'duplicate')
+  assert.equal(await journal.recordExternalObservation!({...observation,destination:'other'}),'conflict')
+  const events=await journal.pending(10)
+  assert.equal(events.length,1)
+  assert.equal(events[0]?.type,'logging.external.confirmation.observed')
+  assert.equal(await journal.visibility(command.target),'visible')
+ } finally {journal.close();rmSync(dir,{recursive:true,force:true})}
+})

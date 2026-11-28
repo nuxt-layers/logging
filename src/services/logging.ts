@@ -1,4 +1,4 @@
-import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision, LifecyclePublisher, ProviderLifecycleRequest, ProviderLifecycleResult, PolicyChange, PolicyChangeResult, AccessResource } from '../contracts/types.ts'
+import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision, LifecyclePublisher, ProviderLifecycleRequest, ProviderLifecycleResult, PolicyChange, PolicyChangeResult, AccessResource, ExternalObservation } from '../contracts/types.ts'
 import { token, instant, bounded, levels, compileRules, effectiveRules, validateDiagnostic, diagnosticCode, plain, fields } from '../policy/validation.ts'
 import { deliver } from '../sinks/delivery.ts'
 
@@ -285,6 +285,14 @@ export function createLogging<E>(options: Options<E>) {
     } catch {return {status:'unavailable'}}
     finally {endLifecycle()}
   }
+  async function observeExternal(observation:Omit<ExternalObservation,'committedAt'|'kind'> & ({kind:'provider';action:'erase'|'restrict'|'recover';recordId:string;destination:string}|{kind:'policy';expectedRevision:string;revision:string})) {
+    if(!journal)return true
+    if(!journal.recordExternalObservation)return false
+    try {
+      const result=await journal.recordExternalObservation({...observation,committedAt:time().instant})
+      return result==='committed'||result==='duplicate'
+    } catch {return false}
+  }
   async function runProviderLifecycle(event:E,request:Pick<ProviderLifecycleRequest,'action'|'target'|'destination'|'requestId'>):Promise<ProviderLifecycleResult> {
     if(!plain(request)||!fields(request,['action','target','destination','requestId']))return {status:'rejected'}
     const {action,destination,requestId,target}=request
@@ -302,7 +310,7 @@ export function createLogging<E>(options: Options<E>) {
       const current=await lifecycleCaller(event,action,{...q,requestId,destination})
       if(!current||current.subjectId!==caller.subjectId||(await options.decide(current,'logging.provider.'+action,Object.freeze({...q,requestId,destination}))).allowed!==true)return {status:'rejected'}
       if(closed||closing)return {status:'unavailable'}
-      if(!journal)return {status:'unavailable'}
+      if(!journal?.recordExternalObservation)return {status:'unavailable'}
       if(action==='recover'&&await journal.visibility(q)!=='visible')return {status:'blocked'}
       if(closed||closing)return {status:'unavailable'}
       const controller=new AbortController()
@@ -310,7 +318,10 @@ export function createLogging<E>(options: Options<E>) {
       let timer:ReturnType<typeof setTimeout>|undefined
       try {
         const result=await Promise.race([options.providerLifecycle({action,target:q,destination,requestId,subjectId:caller.subjectId!,evidenceRef:approval.evidenceRef},controller.signal),new Promise<ProviderLifecycleResult>(resolve=>{timer=setTimeout(()=>{controller.abort();resolve({status:'uncertain'})},timeout)})])
-        if(result?.status==='confirmed'&&token(result.evidenceRef))return {status:'confirmed',evidenceRef:result.evidenceRef}
+        if(result?.status==='confirmed'&&token(result.evidenceRef)){
+          const observed=await observeExternal({kind:'provider',tenantId:q.tenantId,source:q.source,recordId:q.id,action,destination,requestId,subjectId:caller.subjectId!,evidenceRef:result.evidenceRef})
+          return observed?{status:'confirmed',evidenceRef:result.evidenceRef}:{status:'uncertain'}
+        }
         if(result&&(result.status==='blocked'||result.status==='rejected'||result.status==='unavailable'||result.status==='uncertain'))return {status:result.status}
         return {status:'uncertain'}
       } catch {return {status:'uncertain'}}
@@ -320,7 +331,7 @@ export function createLogging<E>(options: Options<E>) {
   }
   async function changePolicy(event:E,input:PolicyChange):Promise<PolicyChangeResult> {
     if(!plain(input)||!fields(input,['tenantId','source','expectedRevision','policy','requestId'])||!token(input.tenantId)||!token(input.source)||!token(input.expectedRevision)||!token(input.requestId)||!plain(input.policy)||!fields(input.policy,['revision','rules'])||!token(input.policy.revision)||input.policy.revision===input.expectedRevision)return {status:'rejected'}
-    if(!options.commitPolicy||!options.resolvePolicy||busy||lifecycleBusy||closing||closed)return {status:'unavailable'}
+    if(!options.commitPolicy||!options.resolvePolicy||(journal&&!journal.recordExternalObservation)||busy||lifecycleBusy||closing||closed)return {status:'unavailable'}
     const {tenantId,source,expectedRevision,requestId}=input
     let change:PolicyChange
     try {change={tenantId,source,expectedRevision,requestId,policy:{revision:input.policy.revision,rules:effectiveRules(floors,input.policy.rules,source,new Set(external.keys()))}}}catch{return {status:'rejected'}}
@@ -336,7 +347,10 @@ export function createLogging<E>(options: Options<E>) {
       if(closed||closing)return {status:'unavailable'}
       try {
         const result=await options.commitPolicy(change,current,approval.evidenceRef)
-        if(result?.status==='committed'&&result.revision===change.policy.revision&&token(result.evidenceRef))return {status:'committed',revision:result.revision,evidenceRef:result.evidenceRef}
+        if(result?.status==='committed'&&result.revision===change.policy.revision&&token(result.evidenceRef)){
+          const observed=await observeExternal({kind:'policy',tenantId,source,requestId,subjectId:caller.subjectId!,expectedRevision,revision:result.revision,evidenceRef:result.evidenceRef})
+          return observed?{status:'committed',revision:result.revision,evidenceRef:result.evidenceRef}:{status:'uncertain'}
+        }
         if(result&&(result.status==='rejected'||result.status==='blocked'||result.status==='conflict'||result.status==='unavailable'||result.status==='uncertain'))return {status:result.status}
         return {status:'uncertain'}
       }catch{return {status:'uncertain'}}

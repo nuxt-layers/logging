@@ -102,3 +102,10 @@ test('durable export fails closed unless release is committed',async()=>{
   assert.equal(result.records.length,outcome==='committed'?1:0)
  }
 })
+
+test('durable policy confirmation requires a committed observation',async()=>{
+ for(const outcome of ['committed','uncertain'] as const){
+  const service=setup({approveLifecycle:clear,resolvePolicy:async()=>({revision:'v1',rules:[]}),commitPolicy:async()=>({status:'committed',revision:'v2',evidenceRef:'provider-ref'}),lifecycleJournal:{commit:async()=> 'committed',visibility:async()=> 'visible',pending:async()=>[],acknowledge:async()=>{},recordExternalObservation:async observation=>{assert.equal(observation.kind,'policy');assert.equal(observation.evidenceRef,'provider-ref');return outcome}}})
+  assert.equal((await service.changePolicy(event,{tenantId:'a',source:'worker',expectedRevision:'v1',requestId:'req',policy:{revision:'v2',rules:[]}})).status,outcome==='committed'?'committed':'uncertain')
+ }
+})

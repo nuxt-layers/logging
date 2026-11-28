@@ -29,7 +29,7 @@ export type LifecycleResult =
 export type ExportResult =
   | { status:'completed-local'; requestId:string; evidenceRef:string; records:RecordEntry[]; coverage:string }
   | { status:'blocked'|'rejected'|'unavailable'|'uncertain'; records:never[] }
-export type LifecycleEvent = Readonly<{
+export type LifecycleEvent = Readonly<ExternalObservation & {version:1;id:string;type:'logging.external.confirmation.observed'}> | Readonly<{
   version:1; id:string; type:'logging.restricted'|'logging.erased'; tenantId:string; source:string;
   recordId:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string
 }> | Readonly<{
@@ -37,6 +37,10 @@ export type LifecycleEvent = Readonly<{
 }> | Readonly<{
   version:1; id:string; type:'logging.export.released'; tenantId:string; source:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string; count:number
 }>
+export type ExternalObservation = {tenantId:string;source:string;requestId:string;subjectId:string;evidenceRef:string;committedAt:string} & (
+  {kind:'provider';action:'erase'|'restrict'|'recover';recordId:string;destination:string} |
+  {kind:'policy';expectedRevision:string;revision:string}
+)
 export type ExportRelease = { tenantId:string; source:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string; count:number }
 export type LifecycleCommit = {
   action:'restrict'|'erase'; target:LifecycleTarget; requestId:string; subjectId:string;
@@ -65,6 +69,7 @@ export type JournalRetentionAuthority = {
 }
 export type LifecycleJournal = {
   commit(command:LifecycleCommit):Promise<'committed'|'duplicate'|'conflict'|'uncertain'>
+  recordExternalObservation?(observation:ExternalObservation):Promise<'committed'|'duplicate'|'conflict'|'uncertain'>
   recordExportRelease?(release:ExportRelease):Promise<'committed'|'conflict'|'uncertain'>
   visibility(target:LifecycleTarget):Promise<'visible'|'restricted'|'erased'>
   pending(limit:number):Promise<LifecycleEvent[]>

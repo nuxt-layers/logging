@@ -99,7 +99,7 @@ export type LifecycleResult =
 export type ExportResult =
   | { status:'completed-local'; requestId:string; evidenceRef:string; records:RecordEntry[]; coverage:string }
   | { status:'blocked'|'rejected'|'unavailable'|'uncertain'; records:never[] }
-export type LifecycleEvent = Readonly<{
+export type LifecycleEvent = Readonly<ExternalObservation & {version:1;id:string;type:'logging.external.confirmation.observed'}> | Readonly<{
   version:1; id:string; type:'logging.restricted'|'logging.erased'; tenantId:string; source:string;
   recordId:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string
 }> | Readonly<{
@@ -107,6 +107,10 @@ export type LifecycleEvent = Readonly<{
 }> | Readonly<{
   version:1; id:string; type:'logging.export.released'; tenantId:string; source:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string; count:number
 }>
+export type ExternalObservation = {tenantId:string;source:string;requestId:string;subjectId:string;evidenceRef:string;committedAt:string} & (
+  {kind:'provider';action:'erase'|'restrict'|'recover';recordId:string;destination:string} |
+  {kind:'policy';expectedRevision:string;revision:string}
+)
 export type ExportRelease = { tenantId:string; source:string; requestId:string; subjectId:string; evidenceRef:string; committedAt:string; count:number }
 export type LifecycleCommit = {
   action:'restrict'|'erase'; target:LifecycleTarget; requestId:string; subjectId:string;
@@ -135,6 +139,7 @@ export type JournalRetentionAuthority = {
 }
 export type LifecycleJournal = {
   commit(command:LifecycleCommit):Promise<'committed'|'duplicate'|'conflict'|'uncertain'>
+  recordExternalObservation?(observation:ExternalObservation):Promise<'committed'|'duplicate'|'conflict'|'uncertain'>
   recordExportRelease?(release:ExportRelease):Promise<'committed'|'conflict'|'uncertain'>
   visibility(target:LifecycleTarget):Promise<'visible'|'restricted'|'erased'>
   pending(limit:number):Promise<LifecycleEvent[]>
@@ -360,6 +365,8 @@ In one host Nitro plugin, import provideLogging, getLogging and closeLogging fro
 POST /api/logging/operation accepts JSON {operation,input,requestId?}; requires exact configured Origin, application/json, x-logging-request: 1, bounded Content-Length (1–32768 bytes), no chunked body. Host ingress must enforce matching body and request-rate limits and same-origin session/CSRF rules. Operations records/delivery/health/policy/export/erase/restrict/provider/policy.change map exactly to the documented service calls. All use trusted server-side caller resolution and separate permissions; no browser submit or composition-root operation. Malformed requests return safe HTTP errors; service outcomes are returned as typed results, not translated into success claims. Disabled/uncomposed service fails closed. No cache or referrer; host must enforce CSP frame-ancestors and TLS. Browser data is transient and cleared on scope edit; no browser storage or download persistence added.
 
 ## Headless surface
+
+External provider and Configuration confirmations are separate authoritative outcomes. With a journal, Logging records a minimised `logging.external.confirmation.observed` event and deduplication identity before returning confirmation; failed observation yields uncertainty, not rollback. The host must reconcile external outcomes by scoped request ID, enforce provider idempotency and publish independently authoritative commits from their own outboxes. There is no distributed atomicity; interruption between external confirmation and local observation remains possible. Provider operations require the observation port. Process-local policy changes have no durable observation.
 
 With a durable journal, protected export requires the journal to commit a minimised `logging.export.released` event and unique scoped request identity before returning records. The event records authorisation to release a bounded snapshot, not receipt by the client, and excludes diagnostic contents. Repeated request identities reject; use a new independently approved request for another export. A journal without this optional port cannot release protected exports. Process-local exports remain non-durable.
 

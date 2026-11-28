@@ -114,6 +114,22 @@ export function createSqliteLifecycleJournal(path) {
         return 'uncertain'
       }
     },
+    async recordExternalObservation(observation) {
+      const {tenantId,source,requestId,subjectId,evidenceRef,committedAt}=observation
+      const detail=observation.kind==='provider'?{kind:'provider',action:observation.action,recordId:observation.recordId,destination:observation.destination}:observation.kind==='policy'?{kind:'policy',expectedRevision:observation.expectedRevision,revision:observation.revision}:null
+      if(!detail||!Number.isFinite(Date.parse(committedAt)))return 'conflict'
+      const fingerprint=JSON.stringify(['external',subjectId,evidenceRef,detail])
+      try {
+        db.exec('BEGIN IMMEDIATE')
+        const previous=lookup.get(tenantId,source,requestId)
+        if(previous){db.exec('ROLLBACK');return previous.fingerprint===fingerprint?'duplicate':'conflict'}
+        const event={version:1,id:randomUUID(),type:'logging.external.confirmation.observed',tenantId,source,requestId,subjectId,evidenceRef,committedAt,...detail}
+        insertRequest.run(tenantId,source,requestId,fingerprint)
+        insertEvent.run(event.id,JSON.stringify(event))
+        db.exec('COMMIT')
+        return 'committed'
+      } catch {try{db.exec('ROLLBACK')}catch{}return 'uncertain'}
+    },
     async recordExportRelease(release) {
       const {tenantId,source,requestId,subjectId,evidenceRef,committedAt,count}=release
       if(!Number.isSafeInteger(count)||count<0||count>100||!Number.isFinite(Date.parse(committedAt)))return 'conflict'
