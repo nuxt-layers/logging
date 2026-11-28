@@ -75,10 +75,11 @@ export type ProviderLifecycleResult =
   | {status:'blocked'|'rejected'|'unavailable'|'uncertain'}
 export type PolicyChange = {tenantId:string;source:string;expectedRevision:string;policy:Policy;requestId:string}
 export type PolicyChangeResult = {status:'committed';revision:string;evidenceRef:string} | {status:'rejected'|'blocked'|'conflict'|'unavailable'|'uncertain'}
+export type AccessResource = { tenantId:string; source:string; id?:string; destination?:string; requestId?:string; expectedRevision?:string; revision?:string; from?:string; to?:string; severity?:Severity; code?:string; correlation?:string; limit?:number; offset?:number }
 export type Options<E> = {
   resolveCaller(event: E): Promise<Caller | null>
   resolveProducer(event: E): Promise<Producer | null>
-  decide(caller: Caller, action: string, resource: { tenantId: string; source: string }): Promise<{ allowed: boolean; reason: string }>
+  decide(caller: Caller, action: string, resource: AccessResource): Promise<{ allowed: boolean; reason: string }>
   now(): { instant: string; quality: 'verified' | 'degraded' | 'unknown' }
   localSink: Sink
   rules: readonly Rule[]

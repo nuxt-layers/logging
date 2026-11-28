@@ -79,3 +79,16 @@ test('shutdown waits for in-flight policy mutation or reports uncertainty',async
  assert.equal((await pending).status,'committed')
  assert.equal((await service.shutdown()).status,'completed')
 })
+
+test('record and query permissions receive exact validated resource',async()=>{
+ const service=setup({approveLifecycle:clear,decide:async(_c,action,resource)=>({allowed:action==='logging.submit'||resource.id==='allowed',reason:'test'})})
+ assert.equal((await service.readDiagnostics(event,{...q,id:'denied'})).status,'rejected')
+ assert.equal((await service.readDiagnostics(event,{...q,id:'allowed'})).status,'completed')
+ assert.equal((await service.eraseDiagnostic(event,{tenantId:'a',source:'worker',id:'denied'},'req')).status,'rejected')
+ assert.equal((await service.eraseDiagnostic(event,{tenantId:'a',source:'worker',id:'allowed'},'req')).status,'completed-local')
+})
+test('policy permission receives expected and proposed revision and request identity',async()=>{
+ const service=setup({approveLifecycle:clear,resolvePolicy:async()=>({revision:'v1',rules:[]}),commitPolicy:async()=>({status:'committed',revision:'v2',evidenceRef:'ref'}),decide:async(_c,action,r)=>({allowed:action==='logging.policy.change'&&r.expectedRevision==='v1'&&r.revision==='v2'&&r.requestId==='req',reason:'test'})})
+ assert.equal((await service.changePolicy(event,{tenantId:'a',source:'worker',expectedRevision:'v1',requestId:'denied',policy:{revision:'v2',rules:[]}})).status,'rejected')
+ assert.equal((await service.changePolicy(event,{tenantId:'a',source:'worker',expectedRevision:'v1',requestId:'req',policy:{revision:'v2',rules:[]}})).status,'committed')
+})

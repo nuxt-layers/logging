@@ -1,4 +1,4 @@
-import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision, LifecyclePublisher, ProviderLifecycleRequest, ProviderLifecycleResult, PolicyChange, PolicyChangeResult } from '../contracts/types.ts'
+import type { Options, RecordEntry, Delivery, Diagnostic, Receipt, DiagnosticQuery, DeliveryState, Policy, Caller, LifecycleTarget, LifecycleAction, LifecycleResult, ExportResult, LifecycleDecision, LifecyclePublisher, ProviderLifecycleRequest, ProviderLifecycleResult, PolicyChange, PolicyChangeResult, AccessResource } from '../contracts/types.ts'
 import { token, instant, bounded, levels, compileRules, effectiveRules, validateDiagnostic, diagnosticCode, plain, fields } from '../policy/validation.ts'
 import { deliver } from '../sinks/delivery.ts'
 
@@ -63,10 +63,11 @@ export function createLogging<E>(options: Options<E>) {
       if(row && ms-Date.parse(row.record.receiptTime)>=retentionFor(row.record)) rows.splice(i,1)
     }
   }
-  async function authorised(event:E,action:string,tenantId:string,source:string) {
+  async function authorised(event:E,action:string,resource:AccessResource) {
+    const {tenantId,source}=resource
     try {
       const caller=await options.resolveCaller(event)
-      return !!caller && caller.tenantId===tenantId && token(tenantId) && token(source) && (await options.decide(caller,action,{tenantId,source})).allowed===true
+      return !!caller && caller.tenantId===tenantId && token(tenantId) && token(source) && (await options.decide(caller,action,Object.freeze({...resource}))).allowed===true
     } catch { return false }
   }
   async function policy(tenantId:string,source:string):Promise<Policy|null> {
@@ -172,7 +173,7 @@ export function createLogging<E>(options: Options<E>) {
   }
   async function readDiagnostics(event:E,query:DiagnosticQuery) {
     const snapshot=snapshotQuery(query)
-    if(!snapshot||!validQuery(snapshot)||!await authorised(event,'logging.read',snapshot.tenantId,snapshot.source)) return {status:'rejected' as const,records:[]}
+    if(!snapshot||!validQuery(snapshot)||!await authorised(event,'logging.read',snapshot)) return {status:'rejected' as const,records:[]}
     try {
       expire(time().ms)
       const offset=snapshot.offset??0
@@ -182,7 +183,7 @@ export function createLogging<E>(options: Options<E>) {
   }
   async function readDeliveryState(event:E,query:DiagnosticQuery) {
     const snapshot=snapshotQuery(query)
-    if(!snapshot||!validQuery(snapshot)||!await authorised(event,'logging.delivery.read',snapshot.tenantId,snapshot.source)) return {status:'rejected' as const,records:[]}
+    if(!snapshot||!validQuery(snapshot)||!await authorised(event,'logging.delivery.read',snapshot)) return {status:'rejected' as const,records:[]}
     try {
       expire(time().ms)
       const offset=snapshot.offset??0
@@ -192,18 +193,19 @@ export function createLogging<E>(options: Options<E>) {
   async function readEffectivePolicy(event:E,scope:{tenantId:string;source:string}) {
     if(!plain(scope)||!fields(scope,['tenantId','source'])||!token(scope.tenantId)||!token(scope.source))return {status:'rejected' as const}
     const {tenantId,source}=scope
-    if(!await authorised(event,'logging.policy.read',tenantId,source)) return {status:'rejected' as const}
+    if(!await authorised(event,'logging.policy.read',{tenantId,source})) return {status:'rejected' as const}
     try {
       const p=await policy(tenantId,source)
       return p?{status:'completed' as const,policy:structuredClone(p)}:{status:'unavailable' as const}
     } catch {return {status:'unavailable' as const}}
   }
-  async function lifecycleCaller(event:E,action:LifecycleAction,tenantId:string,source:string):Promise<Caller|null> {
+  async function lifecycleCaller(event:E,action:LifecycleAction,resource:AccessResource):Promise<Caller|null> {
+    const {tenantId,source}=resource
     try {
       const caller=await options.resolveCaller(event)
       if(!caller||caller.tenantId!==tenantId||!token(tenantId)||!token(source)||!token(caller.subjectId))return null
       const snapshot=Object.freeze({...caller})
-      return (await options.decide(snapshot,'logging.'+action,{tenantId,source})).allowed===true?snapshot:null
+      return (await options.decide(snapshot,'logging.'+action,Object.freeze({...resource}))).allowed===true?snapshot:null
     } catch {return null}
   }
   // The approval port is an independent, attributable precondition, not a Logging receipt.
@@ -218,7 +220,7 @@ export function createLogging<E>(options: Options<E>) {
   async function exportDiagnostics(event:E,query:DiagnosticQuery,requestId:string):Promise<ExportResult> {
     const q=snapshotQuery(query)
     if(!q||!validQuery(q)||!token(requestId))return {status:'rejected',records:[]}
-    const caller=await lifecycleCaller(event,'export',q.tenantId,q.source)
+    const caller=await lifecycleCaller(event,'export',{...q,requestId})
     if(!caller)return {status:'rejected',records:[]}
     if(busy||lifecycleBusy||closing||closed)return {status:'unavailable',records:[]}
     beginLifecycle()
@@ -227,7 +229,7 @@ export function createLogging<E>(options: Options<E>) {
       if(approval.status!=='approved')return {status:approval.status==='blocked'?'blocked':'unavailable',records:[]}
       if(closed||closing)return {status:'unavailable',records:[]}
       // Recheck after the external approval; no data is disclosed on a revoked decision.
-      const current=await lifecycleCaller(event,'export',q.tenantId,q.source)
+      const current=await lifecycleCaller(event,'export',{...q,requestId})
       if(!current||current.subjectId!==caller.subjectId||closed||closing)return {status:'rejected',records:[]}
       expire(time().ms)
       const offset=q.offset??0
@@ -239,7 +241,7 @@ export function createLogging<E>(options: Options<E>) {
   async function changeLocalRecord(event:E,action:'erase'|'restrict',target:LifecycleTarget,requestId:string):Promise<LifecycleResult> {
     if(!plain(target)||!fields(target,['tenantId','source','id'])||!token(target.tenantId)||!token(target.source)||!token(target.id)||!token(requestId))return {status:'rejected'}
     const q={tenantId:target.tenantId,source:target.source,id:target.id}
-    const caller=await lifecycleCaller(event,action,q.tenantId,q.source)
+    const caller=await lifecycleCaller(event,action,{...q,requestId})
     if(!caller)return {status:'rejected'}
     if(busy||lifecycleBusy||closing||closed)return {status:'unavailable'}
     beginLifecycle()
@@ -248,7 +250,7 @@ export function createLogging<E>(options: Options<E>) {
       if(approval.status!=='approved')return {status:approval.status==='blocked'?'blocked':'unavailable'}
       if(action==='erase'&&approval.preservation!=='clear')return {status:approval.preservation==='held'?'blocked':'unavailable'}
       if(closed||closing)return {status:'unavailable'}
-      const current=await lifecycleCaller(event,action,q.tenantId,q.source)
+      const current=await lifecycleCaller(event,action,{...q,requestId})
       if(!current||current.subjectId!==caller.subjectId)return {status:'rejected'}
       if(closed||closing)return {status:'unavailable'}
       if(journal) {
@@ -281,14 +283,14 @@ export function createLogging<E>(options: Options<E>) {
     if(!options.providerLifecycle||busy||lifecycleBusy||closing||closed)return {status:'unavailable'}
     beginLifecycle()
     try {
-      const caller=await lifecycleCaller(event,action,q.tenantId,q.source)
-      if(!caller||(await options.decide(caller,'logging.provider.'+action,q)).allowed!==true)return {status:'rejected'}
+      const caller=await lifecycleCaller(event,action,{...q,requestId,destination})
+      if(!caller||(await options.decide(caller,'logging.provider.'+action,Object.freeze({...q,requestId,destination}))).allowed!==true)return {status:'rejected'}
       if(destination!=='local'&&!external.has(destination))return {status:'rejected'}
       const approval=await approve(action,caller,requestId,q,destination)
       if(approval.status!=='approved')return {status:approval.status==='blocked'?'blocked':'unavailable'}
       if((action==='erase'||action==='recover')&&approval.preservation!=='clear')return {status:approval.preservation==='held'?'blocked':'unavailable'}
-      const current=await lifecycleCaller(event,action,q.tenantId,q.source)
-      if(!current||current.subjectId!==caller.subjectId||(await options.decide(current,'logging.provider.'+action,q)).allowed!==true)return {status:'rejected'}
+      const current=await lifecycleCaller(event,action,{...q,requestId,destination})
+      if(!current||current.subjectId!==caller.subjectId||(await options.decide(current,'logging.provider.'+action,Object.freeze({...q,requestId,destination}))).allowed!==true)return {status:'rejected'}
       if(closed||closing)return {status:'unavailable'}
       if(!journal)return {status:'unavailable'}
       if(action==='recover'&&await journal.visibility(q)!=='visible')return {status:'blocked'}
@@ -314,11 +316,11 @@ export function createLogging<E>(options: Options<E>) {
     try {change={tenantId,source,expectedRevision,requestId,policy:{revision:input.policy.revision,rules:effectiveRules(floors,input.policy.rules,source,new Set(external.keys()))}}}catch{return {status:'rejected'}}
     beginLifecycle()
     try {
-      const caller=await lifecycleCaller(event,'policy.change',tenantId,source)
+      const caller=await lifecycleCaller(event,'policy.change',{tenantId,source,requestId,expectedRevision,revision:change.policy.revision})
       if(!caller)return {status:'rejected'}
       const approval=await approve('policy.change',caller,requestId,change)
       if(approval.status!=='approved')return {status:approval.status==='blocked'?'blocked':'unavailable'}
-      const current=await lifecycleCaller(event,'policy.change',tenantId,source)
+      const current=await lifecycleCaller(event,'policy.change',{tenantId,source,requestId,expectedRevision,revision:change.policy.revision})
       if(!current||current.subjectId!==caller.subjectId)return {status:'rejected'}
       if((await policy(tenantId,source))?.revision!==expectedRevision)return {status:'conflict'}
       if(closed||closing)return {status:'unavailable'}
@@ -333,7 +335,7 @@ export function createLogging<E>(options: Options<E>) {
   }
   async function readPipelineHealth(event:E,query:DiagnosticQuery) {
     const q=snapshotQuery(query)
-    if(!q||!validQuery(q)||!await authorised(event,'logging.health.read',q.tenantId,q.source))return {status:'rejected' as const}
+    if(!q||!validQuery(q)||!await authorised(event,'logging.health.read',q))return {status:'rejected' as const}
     try {
       expire(time().ms)
       const entries=await visibleEntries(q)

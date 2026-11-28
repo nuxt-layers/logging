@@ -145,10 +145,11 @@ export type ProviderLifecycleResult =
   | {status:'blocked'|'rejected'|'unavailable'|'uncertain'}
 export type PolicyChange = {tenantId:string;source:string;expectedRevision:string;policy:Policy;requestId:string}
 export type PolicyChangeResult = {status:'committed';revision:string;evidenceRef:string} | {status:'rejected'|'blocked'|'conflict'|'unavailable'|'uncertain'}
+export type AccessResource = { tenantId:string; source:string; id?:string; destination?:string; requestId?:string; expectedRevision?:string; revision?:string; from?:string; to?:string; severity?:Severity; code?:string; correlation?:string; limit?:number; offset?:number }
 export type Options<E> = {
   resolveCaller(event: E): Promise<Caller | null>
   resolveProducer(event: E): Promise<Producer | null>
-  decide(caller: Caller, action: string, resource: { tenantId: string; source: string }): Promise<{ allowed: boolean; reason: string }>
+  decide(caller: Caller, action: string, resource: AccessResource): Promise<{ allowed: boolean; reason: string }>
   now(): { instant: string; quality: 'verified' | 'degraded' | 'unknown' }
   localSink: Sink
   rules: readonly Rule[]
@@ -319,6 +320,8 @@ Optional providerLifecycle is a qualified host-composed operation for one config
 changePolicy validates the proposed rules against immutable deployment ceilings and the expected revision. Requires logging.policy.change, independent approval bound to the proposal and current same-subject permission. Optional commitPolicy receives change, caller and approval evidence reference; Configuration/host owns the atomic compare-and-set, approved policy persistence, idempotency and independent evidence. Committed means the port confirmed the specified revision, not that all consumers have refreshed. No local shadow policy or fabricated Configuration integration. Missing ports fail closed. Committed export, provider and policy-change events are not yet produced by the Logging journal.
 
 ## Permissions
+
+Access decisions receive the validated query filters or exact lifecycle record ID, request ID, provider destination and proposed/expected policy revision where applicable. Host authorisation must enforce these resource constraints, not merely tenant membership. The service repeats privileged decisions after independent approval.
 
 | Action | Resource | Risk/effect |
 |---|---|---|
