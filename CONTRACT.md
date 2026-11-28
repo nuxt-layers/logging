@@ -1,6 +1,6 @@
 # Logging public consumer contract
 
-Contract revision 1 (diagnostic envelope version 1). Development interface; compatibility and runtime acceptance are not yet verified.
+Contract revision 1 (diagnostic envelope version 1). Development interface; 47 implementation tests passed locally at 18d4d85; independent acceptance and CI remain pending.
 
 Logging is a framework-independent technical diagnostic service. It owns sanitised diagnostic records and their processing/delivery projections. It does not own business transaction outcomes, Audit evidence custody, Observability metrics/traces, Reporting, IAM or legal decisions. Routine Logging failure does not undo a committed business operation.
 
@@ -63,7 +63,7 @@ The named artefacts identify conceptual owners, not mandatory package imports or
 | Durable lifecycle state and outbox | Host-composed Logging-owned journal | lifecycleJournal | Optional implemented port; SQLite adapter provided |
 | Independent lifecycle approval and preservation decision | Host-composed qualified authorities | approveLifecycle | Optional implemented port; missing blocks commands |
 | Scoped pipeline health query | Authorised operators / Observability | readPipelineHealth | Implemented, retained records only |
-| Privileged policy change, provider rights/hold/recovery commands | Authorised operators, Privacy, Legal Compliance | No callable API | Approved; unavailable |
+| Privileged policy change, provider rights/hold/recovery commands | Authorised operators, Privacy, Legal Compliance | Optional qualified ports for policy and individual destination rights; provider-wide hold/export unavailable | Partial |
 
 The following are the exported TypeScript input and output types (package root):
 
@@ -232,6 +232,7 @@ type HostHealth = {
   lastDelivery: Delivery | 'unknown'
   drops: number
   uncertain: number
+  sinkObservationFailures: number
   buffered: number
   intake: Record<Receipt['status'],number>
   activeIntake: number
@@ -247,13 +248,15 @@ interface LoggingSurface<E> {
   readDeliveryState(event: E, query: DiagnosticQuery): Promise<DeliveryResult>
   readEffectivePolicy(event: E, scope: {tenantId:string;source:string}): Promise<PolicyResult>
   readPipelineHealth(event: E, query: DiagnosticQuery): Promise<
-    {status:'completed';observedAt:string;timeQuality:'verified'|'degraded'|'unknown';storage:'durable'|'process-local';withoutDelivery:number;records:number;delivered:number;exhausted:number;uncertain:number;coverage:string}
+    {status:'completed';observedAt:string;timeQuality:'verified'|'degraded'|'unknown';storage:'durable'|'process-local';withoutDelivery:number;backlogRecords:number;oldestBacklogAt:string|null;oldestBacklogAgeMs:number|null;severityDistribution:Record<Severity,number>;destinations:{target:string;state:'ready'|'degraded';observedAt:string;exhausted:number;uncertain:number}[];scopeIntake:Record<Receipt['status'],number>|null;scopeIntakeCoverage:string;records:number;delivered:number;exhausted:number;uncertain:number;coverage:string}
     | {status:'rejected'|'unavailable'}>
   exportDiagnostics(event:E,query:DiagnosticQuery,requestId:string):Promise<ExportResult>
   eraseDiagnostic(event:E,target:LifecycleTarget,requestId:string):Promise<LifecycleResult>
   restrictDiagnostic(event:E,target:LifecycleTarget,requestId:string):Promise<LifecycleResult>
   runProviderLifecycle(event:E,request:Pick<ProviderLifecycleRequest,'action'|'target'|'destination'|'requestId'>):Promise<ProviderLifecycleResult>
   changePolicy(event:E,input:PolicyChange):Promise<PolicyChangeResult>
+  recoverDelivery(event:E,input:DeliveryRecoveryRequest):Promise<DeliveryRecoveryResult>
+  maintainRetirement(limit?:number):Promise<{status:'completed'|'unavailable'|'uncertain';removed:number;held:number}>
   maintainJournal(limit?:number):Promise<{status:'completed'|'unavailable'|'uncertain';removed:number;held:number}>
   maintainRetention(limit?:number):Promise<{status:'completed'|'unavailable'|'uncertain';removed:number;held:number}>
   relayLifecycle(publish:LifecyclePublisher,limit?:number):Promise<{status:'completed'|'unavailable'|'uncertain';published:number}>
@@ -314,7 +317,7 @@ DiagnosticQuery requires tenantId, source, UTC receipt-time from/to (inclusive, 
 
 ### Delivery and policy projections
 
-readDeliveryState uses the same query bounds, returns record IDs and per-target delivery projections. DeliveryState.target identifies local or configured destination; status delivered/exhausted/uncertain; attempts counts attempted writes (zero if skipped); time is system UTC attempt/result time, not verified Clock quality. In-flight destinations may be omitted. Explicit refusal alone permits bounded immediate retry of an external write (max three attempts). Timeout, exception or invalid sink result is uncertain; that external destination is quarantined until recomposition. Local uncertainty closes intake. No automatic restart/replay or confirmed provider deletion. External attempts are synchronous after local acknowledgement; acceptance waits for the bounded attempts.
+readDeliveryState uses the same query bounds, returns record IDs and per-target delivery projections. DeliveryState.target identifies local or configured destination; status delivered/exhausted/uncertain; attempts counts attempted writes (zero if skipped); time is supplied Clock UTC observation time; individual delivery entries do not carry time quality. In-flight destinations may be omitted. Explicit refusal alone permits bounded immediate retry of an external write (max three attempts). Timeout, exception or invalid sink result is uncertain; that external destination is quarantined until recomposition. Local uncertainty closes intake. No automatic restart/replay or confirmed provider deletion. External attempts are synchronous after local acknowledgement; acceptance waits for the bounded attempts.
 
 readEffectivePolicy accepts exactly tenantId and source and returns the authorised scoped rules and revision, not credentials or provider secrets. Missing/invalid policy returns unavailable. It is a projection, not a policy mutation API.
 
@@ -344,7 +347,7 @@ LifecycleEvent contains stable ID, version, event type, tenant/source, opaque re
 
 Pass createSqliteLifecycleJournal(path) as diagnosticStore; it also supplies the lifecycle journal. A different lifecycleJournal alongside it is rejected. The store commits the sanitised envelope before sink invocation and persists observed delivery outcomes. Recovered records are read directly from the scoped store, not replayed to sinks. Empty/incomplete delivery arrays mean no confirmed result was persisted, not successful delivery. A refused or uncertain sink may still leave a diagnostic record. Store uncertainty closes intake; recompose and investigate. The capacity limit applies to persisted records across tenants; held records consume capacity, no silent eviction. Host must use one active service writer per store and coordinate provider/disclosure operations. Store is trusted infrastructure; validate its implementation before deployment.
 
-Ordinary projections exclude records at or beyond their applicable retention limit even when preserved in storage. maintainRetention(limit=20) is composition-root-only, max 100 per call; verified clock and a qualified retentionAuthority are required. Explicit clear permits deletion from Logging's own diagnostic store; held/unknown are retained. No automatic maintenance, provider erasure, legal-authority or physical-media deletion guarantee. Host must ensure preservation decisions remain valid through deletion and coordinate concurrent hold changes. Held records consume capacity but do not permanently block subsequent maintenance pages. Journal tombstones, request fingerprints and events are not deleted by diagnostic retention. Purpose-specific limits are supported through purposeRetention, an optional map from approved rule purpose to positive integer milliseconds no greater than retentionMs. Unknown purposes or invalid limits reject composition. Each new record carries its admission-time limit; reads and maintenance use the minimum of that limit, current purpose limit and global limit, so recomposition cannot extend an admitted limit. Older records without a limit use current settings. Maintenance scans bounded pages by stable tenant/source/record key, advancing past held and nonexpired records and wrapping at the end. This is a process-local cursor, not a completion proof. Governed disposal of request identities and tombstones, and provider-level lifecycle remain outstanding.
+Ordinary projections exclude records at or beyond their applicable retention limit even when preserved in storage. maintainRetention(limit=20) is composition-root-only, max 100 per call; verified clock and a qualified retentionAuthority are required. Explicit clear permits deletion from Logging's own diagnostic store; held/unknown are retained. No automatic maintenance, provider erasure, legal-authority or physical-media deletion guarantee. Host must ensure preservation decisions remain valid through deletion and coordinate concurrent hold changes. Held records consume capacity but do not permanently block subsequent maintenance pages. Journal tombstones, request fingerprints and events are not deleted by diagnostic retention. Purpose-specific limits are supported through purposeRetention, an optional map from approved rule purpose to positive integer milliseconds no greater than retentionMs. Unknown purposes or invalid limits reject composition. Each new record carries its admission-time limit; reads and maintenance use the minimum of that limit, current purpose limit and global limit, so recomposition cannot extend an admitted limit. Older records without a limit use current settings. Maintenance scans bounded pages by stable tenant/source/record key, advancing past held and nonexpired records and wrapping at the end. This is a process-local cursor, not a completion proof. Governed disposal uses separate maintainRetirement; provider-wide lifecycle remains external.
 
 ### Governed journal maintenance
 
@@ -352,7 +355,7 @@ Capacity exhaustion returns unavailable for new local protected commands and res
 
 Read projections recheck permission and reject invalidated local lifecycle generations (LOG_READ_INVALIDATED, surfaced as unavailable); cross-process coordination still belongs to the host.
 
-Optional journalRetention supplies an approved positive retentionMs (maximum 3650 days) and independent resolvePreservation(event) callback. Requires a journal implementing maintenance. maintainJournal(limit=20) is composition-root-only, maximum 100 events per scan, requires verified clock and explicit clear preservation per event. Only acknowledged event payloads with verified acknowledgement timestamps at or before the cutoff are eligible. Unknown acknowledgement times, pending events, held or unknown preservation are never deleted. The adapter rechecks acknowledgement and cutoff at deletion. Rotating scans advance past held entries and wrap; completed means a batch completed, not that the journal is empty. Request identities and restriction/erasure markers remain intact; their governed disposal remains outstanding. Host coordinates concurrent preservation changes and independent evidence retention. No physical-media deletion or backup removal claim. Legacy acknowledged events lacking timestamp are retained.
+Optional journalRetention supplies an approved positive retentionMs (maximum 3650 days) and independent resolvePreservation(event) callback. Requires a journal implementing maintenance. maintainJournal(limit=20) is composition-root-only, maximum 100 events per scan, requires verified clock and explicit clear preservation per event. Only acknowledged event payloads with verified acknowledgement timestamps at or before the cutoff are eligible. Unknown acknowledgement times, pending events, held or unknown preservation are never deleted. The adapter rechecks acknowledgement and cutoff at deletion. Rotating scans advance past held entries and wrap; completed means a batch completed, not that the journal is empty. Request identities and restriction/erasure markers remain intact; their governed disposal is handled separately by maintainRetirement. Host coordinates concurrent preservation changes and independent evidence retention. No physical-media deletion or backup removal claim. Legacy acknowledged events lacking timestamp are retained.
 
 ### Provider lifecycle and policy changes
 
@@ -374,6 +377,9 @@ Access decisions receive the validated query filters or exact lifecycle record I
 | logging.export | Requested tenantId/source | Protected local diagnostic disclosure |
 | logging.erase | Requested tenantId/source | Remove local projection; clear preservation required |
 | logging.restrict | Requested tenantId/source | Hide local projection |
+| logging.health.scope.read | Exact tenant/source | Process-lifetime intake counts, independent of query filters |
+| logging.delivery.retry | Exact record, destination, request | Protected explicit-refusal retry |
+| logging.delivery.reconcile | Exact record, destination, request | Protected evidence-only reconciliation |
 | logging.recover | Requested tenantId/source | Authorise qualified recovery |
 | logging.provider.erase / restrict / recover | Requested tenantId/source | Additional destination operation permission |
 | logging.policy.change | Requested tenantId/source | Governed policy change |
@@ -404,7 +410,7 @@ Durable retention expiry emits `logging.expired` atomically with removal; the ma
 
 Implemented: validated diagnostic admission, sanitised sink output, scoped reads, delivery projection, effective policy projection, scoped retained-record health, protected local export/restriction/erasure, host health and shutdown. These work without a GUI, Nuxt or external destinations. No mandatory database.
 
-Approved but unavailable: provider-wide export, provider hold management, complete scoped loss/backlog health, committed lifecycle events for other operations, automatic replay/reconciliation of uncertain sink writes and manual retry. Do not call invented methods or substitute Logging receipts for Audit evidence. Missing provider contracts must be reconciled before claiming those integrations.
+Approved but unavailable: provider-wide export, provider hold management, complete scoped loss/backlog health, committed lifecycle events for other operations, automatic replay of uncertain sink writes. Do not call invented methods or substitute Logging receipts for Audit evidence. Missing provider contracts must be reconciled before claiming those integrations.
 
 ### Governed retirement and sink observations
 
@@ -424,4 +430,4 @@ The protected HTTP operations `delivery.retry` and `delivery.reconcile` require 
 
 Identifiers use ASCII alphanumeric first character, then up to 95 alphanumeric/underscore/dot/colon/hyphen characters. Syntax is not proof of safe provenance. UTC timestamps use YYYY-MM-DDTHH:mm:ss[.SSS]Z with 1–3 optional fractional digits. Only one submission in flight; concurrent calls receive unavailable. Policy sampling uses the tenant/source minute admission counter. Expiry is lazy on submit/read; history is not durable unless diagnosticStore is configured; provider retention is independent. Shutdown and local uncertainty do not prove write reversal. Never use this subset for regulated retention, evidence custody or legal hold fulfilment.
 
-Compatibility: version 1 envelope and named receipt categories/codes are the current development contract; no released compatibility assurance. Breaking field, result or semantic changes require coordinated contract revision and affected consumer acceptance. Master 2ea7df6 passed Quality on its packaged PR head 1b70343. Current branch verification and independent consumer acceptance remain pending.
+Compatibility: version 1 envelope and named receipt categories/codes are the current development contract; no released compatibility assurance. Breaking field, result or semantic changes require coordinated contract revision and affected consumer acceptance. Local implementation verification at 18d4d85 passed 47 tests, typecheck, build, contract and composition checks. Independent consumer acceptance and final CI remain pending.
