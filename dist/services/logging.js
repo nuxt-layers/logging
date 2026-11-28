@@ -932,7 +932,7 @@ export function createLogging(options) {
             for (const candidate of candidates) {
                 if (closing || closed)
                     return { status: 'unavailable', removed, held };
-                if (!['request', 'marker'].includes(candidate.kind) || ![candidate.tenantId, candidate.source, candidate.id, candidate.version].every(token))
+                if (!['request', 'marker', 'recovery', 'sink'].includes(candidate.kind) || ![candidate.tenantId, candidate.source, candidate.id, candidate.version].every(token))
                     return { status: 'unavailable', removed, held };
                 const snapshot = Object.freeze({ ...candidate });
                 retirementCursor = snapshot;

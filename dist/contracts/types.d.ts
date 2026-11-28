@@ -206,7 +206,7 @@ export type SinkObservation = {
     timeQuality: RecordEntry['timeQuality'];
 };
 export type RetirementCandidate = {
-    kind: 'request' | 'marker';
+    kind: 'request' | 'marker' | 'recovery' | 'sink';
     tenantId: string;
     source: string;
     id: string;
